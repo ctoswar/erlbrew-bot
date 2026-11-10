@@ -1,0 +1,236 @@
+# Erlbrew Café — static bot content (friendly Taglish).
+# EDIT THIS FILE ANYTIME — the bot re-reads it automatically (no restart needed).
+# Replace every [PLACEHOLDER: ...] before going live.
+# Payload names are referenced by the persistent menu, ice breakers and quick
+# replies configured in setup_profile.py (do not rename them casually).
+
+entries:
+  - id: get_started
+    payloads: [GET_STARTED]
+    answer: |
+      [PLACEHOLDER: WELCOME MESSAGE — i-adjust ang tone kung gusto nyo]
+      Hi! Welcome po sa Erlbrew Café sa Kawit, Cavite! ☕
+      Ako po si Erl, ang chat assistant namin. I-type lang po ang tanong nyo,
+      o piliin po ang isa sa mga buttons sa baba. Salamat po! 😊
+    quick_replies:
+      - title: Menu
+        payload: MENU
+      - title: Hours & Location
+        payload: HOURS
+      - title: Promo
+        payload: PROMO
+      - title: Events
+        payload: EVENTS
+
+  - id: menu
+    payloads: [MENU]
+    keywords:
+      - menu
+      - price
+      - prices
+      - presyo
+      - magkano
+      - kape
+      - coffee
+      - drinks
+      - inumin
+      - food
+      - pagkain
+      - order
+    answer: |
+      Eto po ang aming menu ☕
+      📋 Ito po ang latest menu at presyo namin:
+      https://erlbrew.codigital.services/
+    quick_replies:
+      - title: Hours & Location
+        payload: HOURS
+      - title: Promo
+        payload: PROMO
+      - title: Events
+        payload: EVENTS
+
+  - id: hours
+    payloads: [HOURS]
+    keywords:
+      - hours
+      - oras
+      - open
+      - bukas
+      - close
+      - closing
+      - opening
+      - location
+      - address
+      - nasaan
+      - saan
+      - map
+      - maplink
+      - landmark
+    answer: |
+      ⏰ Open po kami daily, 8:00 AM – 9:00 PM.
+      🗺️ Location & directions po dito — kita ninyo na nang buo:
+      https://maps.app.goo.gl/vXVz1TLBYA8KuNy79
+      Kitakits po sa Erlbrew Café, Kawit, Cavite! Salamat po! ☕
+    quick_replies:
+      - title: Menu
+        payload: MENU
+      - title: Promo
+        payload: PROMO
+      - title: Events
+        payload: EVENTS
+
+  - id: location
+    payloads: [LOCATION]
+    keywords:
+      - where are you
+      - where po kayo
+      - how to go
+      - directions
+      - papuntang
+    answer: |
+      Erlbrew Café po — sa Kawit, Cavite kami!
+      🗺️ Exact location & directions dito: https://maps.app.goo.gl/vXVz1TLBYA8KuNy79
+      ⏰ Open po daily, 8:00 AM – 9:00 PM.
+    quick_replies:
+      - title: Hours & Location
+        payload: HOURS
+
+  - id: promo
+    payloads: [PROMO]
+    keywords:
+      - promo
+      - promos
+      - discount
+      - discounted
+      - sale
+      - deal
+      - deals
+      - libre
+      - freebie
+    answer: |
+      [PLACEHOLDER: CURRENT PROMO/S — laging updated bago mag-expire]
+      🎉 [PLACEHOLDER: e.g. Fridays 11 AM-3 PM: Buy 1 Spanish Latte, get 1 free]
+      [PLACEHOLDER: e.g. Student discount 10% with valid ID]
+      Salamat po!
+    quick_replies:
+      - title: Menu
+        payload: MENU
+      - title: Hours & Location
+        payload: HOURS
+
+  - id: wifi
+    keywords:
+      - wifi
+      - wi-fi
+      - internet
+      - signal
+    answer: |
+      Opo! We have WiFi here sa Erlbrew Café ☕ Libre siya para sa lahat ng
+      guests — feel free to work or chill while you sip. Salamat po!
+
+  - id: delivery
+    keywords:
+      - delivery
+      - deliver
+      - pahatid
+      - pabili
+      - grabfood
+      - foodpanda
+      - shopeefood
+    answer: |
+      Opo! Kami-kami po mismo ang nagde-deliver ☕ Walang FoodPanda/GrabFood
+      sa amin — dito po sa Messenger kayo mag-message ng order.
+      🆓 FREE po ang delivery sa Masaito at Lancaster residence.
+      🛵 Outside those areas po — send po namin via Lalamove; sabihin ng
+      team natin ang exact delivery fee bago po kayo magpay.
+      Fine, i-type po ang "order" (o i-tap ang button sa baba 👇) para
+      simulan natin ang order ninyo — kukuha lang po yoon ng items,
+      address at mobile number ninyo. Salamat po!
+    quick_replies:
+      - title: Order now
+        payload: ORDER_START
+      - title: Menu
+        payload: MENU
+      - title: Hours & Location
+        payload: HOURS
+
+  - id: pickup
+    keywords:
+      - pickup
+      - pick up
+      - takeout
+      - take out
+      - takeaway
+      - take away
+      - to go
+    answer: |
+      Oo po, may PICKUP po kami! 👍
+      [PLACEHOLDER: pickup instructions — e.g. cut-off 8 PM, ready in 20 mins,
+      i-text po ang order sa ___ o DM dito]
+
+  - id: parking
+    keywords:
+      - parking
+      - park
+      - parada
+      - where to park
+    answer: |
+      [PLACEHOLDER: PARKING DETAILS — free o may bayad? ilang slots?
+      street parking ba? meron ding slots para motors/bikes?]
+
+  - id: payment
+    keywords:
+      - payment
+      - pay
+      - bayad
+      - gcash
+      - maya
+      - paypal
+      - cash
+      - card
+      - credit card
+      - debit
+    answer: |
+      [PLACEHOLDER: ACCEPTED PAYMENTS — e.g. Cash 💵, GCash, Maya at debit/credit POS]
+      [PLACEHOLDER: GCash number kung may to-go / delivery orders]
+
+  - id: events
+    payloads: [EVENTS]
+    keywords:
+      - event
+      - events
+      - book
+      - booking
+      - party
+      - birthday
+      - meeting
+      - photoshoot
+      - salubong
+      - despedida
+    answer: |
+      Oo po! 🎉 Nagho-host po kami sa Erlbrew ng private events:
+      🎂 Birthdays · 🧾 Meetings · 📸 Photoshoots · 🎗️ [PLACEHOLDER: iba pang event type]
+      [PLACEHOLDER: EVENT BASICS — e.g. capacity ~30 pax, exclusive? deposit?
+      setup fee? corkage? package details]
+      Para mag-book, i-tap po ang "Start booking" sa baba 👇 — makaka-receive
+      po kayo ng maikling form, sasagot po ang aming team within 24 hours.
+      Hindi po namin kayo agad ma-confirm ng availability ngayon, kasama po ng
+      exact prices at scheduling sa reply ng team namin. Salamat po!
+    quick_replies:
+      - title: Start booking
+        payload: EVT_START
+      - title: Menu
+        payload: MENU
+      - title: Back to start
+        payload: GET_STARTED
+
+  - id: fallback_help
+    keywords:
+      - help
+      - tulong
+      - hello
+      - hi
+    answer: |
+      Ako po si Erl ng Erlbrew Café ☕ Pwedeng-pwedeng magtanong tungkol sa
+      menu, presyo, oras, location, promo, parking at events — i-type lang po!
+      O piliin po ang isa sa mga buttons sa baba. 😊

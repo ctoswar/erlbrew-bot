@@ -1,0 +1,92 @@
+# Erlbrew Café Messenger bot
+# Runs as its own container next to the POS on the shared Ubuntu server.
+#
+#   - ./data volume holds the live-editable faq.yaml / knowledge.md and the SQLite db
+#   - extra_hosts maps host.docker.internal -> host gateway so the bot can reach an
+#     Ollama instance running on the Docker host (or anywhere on the LAN via OLLAMA_BASE_URL)
+#
+# If you change PORT in .env, adjust the published port below to match.
+services:
+  erlbrew-bot:
+    build: .
+    image: erlbrew-bot:latest
+    container_name: erlbrew-bot
+    restart: unless-stopped
+    # Run as the host's user so the ./data bind mount (SQLite db) is writable.
+    user: "1000:1000"
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Exposed on ALL interfaces: LAN (192.168.x.x), Tailscale (100.x.x.x)
+    # and WAN traffic the router forwards to us. /webhook is signature-verified
+    # (403 without a valid HMAC), /admin needs X-Admin-Token — safe to expose.
+    # NOTE: "WAN" here still needs the router to forward port 8085 -> this
+    #       server's LAN IP (Meta can use a Cloudflare Tunnel URL either way).
+    ports:
+      - "0.0.0.0:8085:8000"
+    volumes:
+      - ./data:/app/data
+    # Low CPU / RAM budget (honoured by modern docker compose; Portainer stacks too)
+    deploy:
+      resources:
+        limits:
+          cpus: "0.60"
+          memory: 256M
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 2
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ---------------------------------------------------------------------
+  # Ollama sidecar for the AI fallback answers.
+  #
+  # The host's own Ollama systemd service only listens on 127.0.0.1:11434
+  # (the unit has no OLLAMA_HOST override), so containers can't reach it.
+  # The bot therefore uses this private instance over the compose network:
+  #   OLLAMA_BASE_URL=http://ollama:11434   (see .env)
+  # CPU-only — fine for the small qwen3.5:2b model. Models are stored in a
+  # named Docker volume so they survive container recreation.
+  #
+  # If you later fix the host service (sudo systemctl edit ollama ->
+  # Environment="OLLAMA_HOST=0.0.0.0:11434"), you can delete this service,
+  # the volumes: block below, and switch .env back to http://<server-LAN-IP>:11434
+  # ---------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=30m
+      - OLLAMA_NUM_PARALLEL=1
+    volumes:
+      - ollama_models:/root/.ollama
+    # Loopback-only on the host, purely for manual curl tests.
+    # The bot never uses this port; it talks to http://ollama:11434 directly.
+    ports:
+      - "127.0.0.1:11435:11434"
+    deploy:
+      resources:
+        limits:
+          # all 4 cores — 2B model generation speed depends on this
+          cpus: "4.0"
+          memory: 6G
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  ollama_models:
