@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 import config
+import db
 
 log = logging.getLogger("messenger")
 
@@ -63,6 +64,15 @@ async def post_graph(op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if resp.status_code >= 400 or "error" in data:
         err = data.get("error") or {}
         raise MessengerError(op, resp.status_code, str(err.get("message") or resp.text[:200]))
+    # Remember our own message ids: Meta echoes them back to the webhook, and
+    # we must not mistake our reply for a human team member joining the chat.
+    mid = str(data.get("message_id") or "")
+    if mid:
+        try:
+            if db.connected():
+                await db.mark_bot_message(mid)
+        except Exception:
+            log.warning("could not record bot message id")
     return data
 
 

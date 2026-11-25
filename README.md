@@ -28,6 +28,11 @@ Cloudflare Tunnel ──► this service (FastAPI, Docker container)
 - Echo filtering, **dedupe by message id** (SQLite), per-user rate limit
   (15 msgs / 10 min) and 500-char cap — one polite notice, then silence.
 - Paused users (human handoff) get **no automatic replies** at all.
+- **Human takeover**: when a page admin replies from the Page inbox, the bot
+  pauses that conversation (and cancels any half-finished form) so it never
+  talks over the team. Resume with `POST /admin/unpause/{psid}` or
+  `python main.py unpause <PSID>`. The bot's own outgoing echoes are
+  recognised by message id and ignored, so it does not pause itself.
 - Postbacks & quick replies (`MENU`, `HOURS`, `PROMO`, `EVENTS`, `GET_STARTED`,
   `EVT_START`) answered from `faq.yaml`.
 - **Event booking form** — deterministic state machine (not LLM-driven):
@@ -46,8 +51,9 @@ Cloudflare Tunnel ──► this service (FastAPI, Docker container)
   degrades to plain free-text items; **the bot never invents a price**.
   Completed orders are saved to SQLite + Telegram ping; per-PSID webhook
   events are serialized so burst messages can't race the form; abandoned
-  forms self-destruct after 2 h; the bot pauses after each order and
-  auto-resumes when a page admin replies.
+  forms self-destruct after 2 h; the bot pauses after each order and stays
+  silent while a page admin is handling the chat (resume with
+  `/admin/unpause/{psid}` or the `unpause` CLI command).
 - Handoff keywords (complaint, refund, allergy, allergic, bulk order, human,
   staff, tao, reklamo) → polite message, pause the user, Telegram alert.
 - Keyword/regex FAQ matching (menu, price, hours, location, wifi, promo,

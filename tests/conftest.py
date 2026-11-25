@@ -199,9 +199,14 @@ def make_message_event(
         msg.setdefault("text", "")
     if is_echo:
         msg["is_echo"] = True
+    # Echoes are page-side messages: the Page is the sender, the customer is
+    # the recipient (the opposite of a customer message).
+    sender, recipient = {"id": psid}, {"id": "PAGE"}
+    if is_echo:
+        sender, recipient = {"id": "PAGE"}, {"id": psid}
     return {
-        "sender": {"id": psid},
-        "recipient": {"id": "PAGE"},
+        "sender": sender,
+        "recipient": recipient,
         "timestamp": int(time.time() * 1000),
         "message": msg,
     }
