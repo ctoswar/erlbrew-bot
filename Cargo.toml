@@ -1,0 +1,46 @@
+[package]
+name = "erlbrew-bot"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Erlbrew Café Facebook Messenger bot — native Rust rewrite"
+license = "MIT"
+
+[lib]
+name = "erlbrew_bot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "erlbrew-bot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["macros"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+hmac = "0.12"
+mysql_async = { version = "0.37", default-features = false, features = ["minimal", "rustls-tls", "ring"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+strsim = "0.11"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

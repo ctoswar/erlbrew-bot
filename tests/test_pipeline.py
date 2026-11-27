@@ -98,10 +98,11 @@ async def test_non_text_message_gets_single_polite_reply(api, sends, tg, llm_mar
     assert sends.texts().count(config.NON_TEXT_TEXT) == 2
 
 
-async def test_echoes_are_ignored(api, sends, tg):
+async def test_page_echo_gets_no_reply(api, sends, tg):
     await post_message(api, make_message_event(psid="P_P8", text="our own outgoing msg", is_echo=True))
     await flush()
     assert sends.texts() == []
+    assert await db.get_paused("P_P8") is True
 
 
 async def test_form_payloadsent_inside_form_use_form(api, sends, tg, llm_marker):

@@ -1,9 +1,10 @@
 """Erlbrew Café — Facebook Messenger webhook service (rule-based first).
 
 Message pipeline (in order):
-  1. Skip echoes; dedupe by message id; per-user rate limit (15/10 min) and
-     500-char text cap (one polite notice, then ignore).
-  2. Paused users (human handoff) get no replies.
+  1. Ignore the bot's own echoes; a human page reply puts the chat in team
+     mode (bot paused). Then dedupe by message id; per-user rate limit
+     (15/10 min) and 500-char text cap (one polite notice, then ignore).
+  2. Paused users (human handoff / team takeover) get no replies.
   3. Postbacks / quick replies (MENU, HOURS, PROMO, EVENTS, GET_STARTED, ...)
      answer from faq.yaml.
   4. An active event form continues (deterministic state machine).
@@ -244,31 +245,51 @@ _PSID_LOCKS: Dict[str, asyncio.Lock] = {}
 
 
 async def process_event(event: Dict[str, Any]) -> None:
-    psid = str(((event.get("sender") or {}).get("id") or "")).strip()
+    message = event.get("message") if isinstance(event.get("message"), dict) else None
+    is_echo = bool(message and message.get("is_echo"))
+    if is_echo:
+        # Page-side messages (echoes) have the Page as sender and the customer
+        # as recipient, so all per-customer state must key off the recipient.
+        psid = str(((event.get("recipient") or {}).get("id") or "")).strip()
+    else:
+        psid = str(((event.get("sender") or {}).get("id") or "")).strip()
     try:
         if not psid:
             return
         lock = _PSID_LOCKS.setdefault(psid, asyncio.Lock())
         async with lock:
-            if "postback" in event:
+            if is_echo and message is not None:
+                await _handle_echo(psid, message)
+            elif "postback" in event:
                 await _handle_postback(psid, dict(event.get("postback") or {}))
-            elif isinstance(event.get("message"), dict):
-                message = dict(event["message"])
-                if message.get("is_echo"):
-                    # A page-side (staff) message. The bot stays silent on those,
-                    # but the first staff reply ALSO resumes the bot for that
-                    # customer — that's how team mode ends after handoff/orders.
-                    recipient = str(((event.get("recipient") or {}).get("id") or "")).strip()
-                    if recipient and await db.get_paused(recipient):
-                        if await db.unpause_user(recipient):
-                            hdl.info("team replied; bot resumed", extra={"psid": recipient})
-                    return
+            elif message is not None:
                 await _handle_message(psid, message)
             # delivery / read / referral events are intentionally ignored
     except Exception:
         hdl.exception("event processing failed", extra={"psid": psid})
     finally:
         messenger.stop_typing(psid)
+
+
+async def _handle_echo(psid: str, message: Dict[str, Any]) -> None:
+    """A message sent from the Page side (not by the customer).
+
+    Our own replies also come back as echoes; those are recognised by message
+    id and ignored. Any *other* page-side message is a human team member
+    typing in the Page inbox — that is a takeover, so the bot must go silent
+    for this customer and stay silent until an admin explicitly unpauses.
+    """
+    mid = str(message.get("mid") or "")
+    if mid and await db.is_bot_message(mid):
+        return
+    await db.upsert_user(psid)
+    already_paused = await db.get_paused(psid)
+    await db.set_paused(psid, True)
+    # Abandon any half-finished form so the bot can't keep asking questions
+    # over the human who just joined the conversation.
+    await db.delete_form(psid)
+    if not already_paused:
+        hdl.info("team replied; bot paused", extra={"psid": psid})
 
 
 async def _handle_postback(psid: str, postback: Dict[str, Any]) -> None:

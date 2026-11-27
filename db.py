@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS seen_messages (
     mid         TEXT PRIMARY KEY,
     created_at  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bot_messages (
+    mid         TEXT PRIMARY KEY,
+    created_at  INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rate_events (
     psid        TEXT NOT NULL,
     ts          INTEGER NOT NULL
@@ -202,6 +206,24 @@ async def mark_message_seen(mid: str) -> bool:
     return cur.rowcount > 0
 
 
+async def mark_bot_message(mid: str) -> None:
+    """Remember a message id the bot itself sent (to recognise its own echoes)."""
+    assert _conn is not None
+    await _conn.execute(
+        "INSERT OR IGNORE INTO bot_messages (mid, created_at) VALUES (?, ?)",
+        (mid, _now()),
+    )
+    await _conn.commit()
+
+
+async def is_bot_message(mid: str) -> bool:
+    """True when `mid` belongs to a message the bot sent (not a human reply)."""
+    if not mid:
+        return False
+    row = await _fetchone("SELECT 1 FROM bot_messages WHERE mid=?", (mid,))
+    return row is not None
+
+
 async def note_rate_event(psid: str) -> None:
     assert _conn is not None
     await _conn.execute(
@@ -364,6 +386,7 @@ async def cleanup(
     assert _conn is not None
     now = _now()
     await _conn.execute("DELETE FROM seen_messages WHERE created_at < ?", (now - seen_ttl_sec,))
+    await _conn.execute("DELETE FROM bot_messages WHERE created_at < ?", (now - seen_ttl_sec,))
     await _conn.execute("DELETE FROM chat_history WHERE created_at < ?", (now - history_ttl_sec,))
     await _conn.execute("DELETE FROM event_forms WHERE updated_at < ?", (now - form_ttl_sec,))
     await _conn.commit()

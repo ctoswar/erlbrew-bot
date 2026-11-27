@@ -290,8 +290,8 @@ async def _finish(psid: str, data: _VALIDATOR_ARGS) -> Reply:
         total_estimate=total_estimate,
     )
     await db.delete_form(psid)
-    # The customer follows up with staff now — silence the bot until the team
-    # replies (their page-side message auto-resumes the bot).
+    # The customer follows up with staff now — silence the bot until an admin
+    # explicitly resumes it (a human page reply keeps it paused).
     await db.set_paused(psid, True)
     log.info(
         "order saved",

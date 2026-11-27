@@ -166,19 +166,60 @@ async def test_bulk_order_goes_to_team_not_form(api, sends, tg):
     assert len(tg["handoff"]) == 1
 
 
-async def test_team_echo_resumes_paused_customer(api, sends, tg):
+async def test_team_echo_pauses_customer(api, sends, tg):
+    """A human replying from the Page inbox takes over: the bot goes silent."""
     psid = "PSID_ORD7"
-    await db.set_paused(psid, True)
+    await db.upsert_user(psid)
     echo = {
         "sender": {"id": "ERLBREW_PAGE"},
         "recipient": {"id": psid},
         "timestamp": 1,
-        "message": {"is_echo": True, "mid": "echo.mid.1", "text": "Confirmed po your order!"},
+        "message": {"is_echo": True, "mid": "echo.mid.1", "text": "Hi po, ako po si Ana"},
     }
     from conftest import post_message as pm  # local alias for clarity
     await pm(api, echo)
     await flush()
-    assert not await db.get_paused(psid)
+    assert await db.get_paused(psid) is True
+    assert sends.texts() == []  # the bot does not answer the human
+
+
+async def test_team_echo_cancels_active_form(api, sends, tg):
+    psid = "PSID_ORD8"
+    await post_message(api, make_message_event(psid=psid, text="order po"))
+    await flush()
+    assert await _active_step(psid) == "order_items"
+
+    echo = {
+        "sender": {"id": "ERLBREW_PAGE"},
+        "recipient": {"id": psid},
+        "timestamp": 2,
+        "message": {"is_echo": True, "mid": "echo.mid.2", "text": "Ako na po ang bahala"},
+    }
+    from conftest import post_message as pm
+
+    await pm(api, echo)
+    await flush()
+    assert not await db.get_form(psid)
+    assert await db.get_paused(psid) is True
+
+
+async def test_bot_echo_does_not_pause_customer(api, sends, tg):
+    """Echoes of the bot's own sends must not silence it."""
+    psid = "PSID_ORD9"
+    await db.upsert_user(psid)
+    await db.mark_bot_message("bot.mid.9")
+    echo = {
+        "sender": {"id": "ERLBREW_PAGE"},
+        "recipient": {"id": psid},
+        "timestamp": 3,
+        "message": {"is_echo": True, "mid": "bot.mid.9", "text": "Salamat po!"},
+    }
+    from conftest import post_message as pm
+
+    await pm(api, echo)
+    await flush()
+    assert await db.get_paused(psid) is False
+    assert sends.texts() == []
 
 
 async def test_admin_orders_endpoint(api, sends, tg):
