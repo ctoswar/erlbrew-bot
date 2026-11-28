@@ -47,7 +47,12 @@ impl App {
 impl App {
     /// Fully in-memory app for tests: no network config, no LLM, no POS menu.
     pub fn for_test() -> Self {
-        let settings = Arc::new(Settings::for_test());
+        Self::for_test_with(Settings::for_test())
+    }
+
+    /// Same, but with custom settings.
+    pub fn for_test_with(settings: Settings) -> Self {
+        let settings = Arc::new(settings);
         let db = Arc::new(Db::connect(":memory:").unwrap());
         let http = reqwest::Client::new();
         App {

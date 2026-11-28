@@ -1,6 +1,7 @@
 //! Erlbrew Café — Facebook Messenger webhook service (native Rust).
 
 mod acks;
+mod topics;
 mod config;
 mod db;
 mod events;

@@ -5,6 +5,7 @@
 //! directly without a network.
 
 pub mod acks;
+pub mod topics;
 pub mod config;
 pub mod db;
 pub mod events;

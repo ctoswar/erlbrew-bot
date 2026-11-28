@@ -2,7 +2,7 @@
 # EDIT THIS FILE ANYTIME — the bot re-reads it automatically (no restart needed).
 # Replace every [PLACEHOLDER: ...] before going live.
 # Payload names are referenced by the persistent menu, ice breakers and quick
-# replies configured in setup_profile.py (do not rename them casually).
+# replies configured for the Messenger page (do not rename them casually).
 
 entries:
   - id: get_started
@@ -209,13 +209,9 @@ entries:
       - despedida
     answer: |
       Oo po! 🎉 Nagho-host po kami sa Erlbrew ng private events:
-      🎂 Birthdays · 🧾 Meetings · 📸 Photoshoots · 🎗️ [PLACEHOLDER: iba pang event type]
-      [PLACEHOLDER: EVENT BASICS — e.g. capacity ~30 pax, exclusive? deposit?
-      setup fee? corkage? package details]
-      Para mag-book, i-tap po ang "Start booking" sa baba 👇 — makaka-receive
-      po kayo ng maikling form, sasagot po ang aming team within 24 hours.
-      Hindi po namin kayo agad ma-confirm ng availability ngayon, kasama po ng
-      exact prices at scheduling sa reply ng team namin. Salamat po!
+      🎂 Birthdays · 🧾 Meetings · 📸 Photoshoots
+      I-tap lang po ang 'Start booking' sa baba 👇 at ang aming team po ang magse-send
+      ng packages at details within 24 hours. Salamat po!
     quick_replies:
       - title: Start booking
         payload: EVT_START

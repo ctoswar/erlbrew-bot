@@ -29,6 +29,17 @@ Cloudflare Tunnel ──► this service (Rust/axum, Docker container)
   background task.
 - Echo filtering, **dedupe by message id** (SQLite), per-user rate limit
   (15 msgs / 10 min) and 500-char cap — one polite notice, then silence.
+- **Loyalty program**: "loyalty card", "stamps", "points", "rewards" → the bot points to the
+  Erlbrew loyalty app (`https://app.erlbrewcafe.page/`). It never invents how many stamps are
+  needed or what the reward is — the stamp policy lives in `LOYALTY_POLICY` in `src/topics.rs`
+  and stays empty until the owner fills it in. Lost points, a missing stamp or an app problem
+  are handed to the team (the customer is paused and Telegram is notified).
+- **Private events**: "events", "birthday", "meeting", "photoshoot", "packages" → what the café
+  hosts plus a pointer to the **Start booking** button. No prices, packages, capacity or
+  availability are ever listed — the team sends those after the booking form.
+- **Reservations (regular seating)**: "mag-reserve ng table", "may reservation ba?", "i-hold yung
+  seats" → walk-in only, first come first served. No table is ever promised or held. This is
+  checked *before* the booking intent, so "mag-reserve ng table" never opens the event form.
 - Paused users (human handoff) get **no automatic replies** at all.
 - **Acknowledgements & closings**: "thank you", "salamat", "ty", "ok", "okay", "sige", "noted",
   "got it", "alright", 👍 🙏 → **one** short warm Taglish line (rotating, one emoji max).
@@ -78,6 +89,7 @@ Cloudflare Tunnel ──► this service (Rust/axum, Docker container)
 | `src/faq.rs` | hot-reloading FAQ engine |
 | `src/forms.rs` | shared form helpers (reply type, validation, cancel) |
 | `src/acks.rs` | acknowledgement / closing detection + rotating closing lines |
+| `src/topics.rs` | deterministic answers: loyalty, private events, reservations |
 | `src/events.rs` | event booking state machine |
 | `src/orders.rs` | order intake state machine |
 | `src/menu.rs` | live POS menu reader (read-only MySQL, TTL cache, fuzzy matcher) |

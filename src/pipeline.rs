@@ -8,15 +8,18 @@
 //!   7. Acknowledgements / closings ("thank you", "ok", 👍) -> one warm line
 //!   8. Active event/order form continues
 //!   9. Handoff keywords -> pause + Telegram
-//!  10. Order / event intent starts a form
-//!  11. Keyword/regex FAQ match
-//!  12. LLM fallback
+//!  10. Reservations (regular seating) -> walk-in only
+//!  11. Order / event intent starts a form
+//!  12. Loyalty program / private events (deterministic answers)
+//!  13. Keyword/regex FAQ match
+//!  14. LLM fallback
 
 use crate::acks;
 use crate::config::{
     EVENT_INTENT_RE, HANDOFF_RE, HANDOFF_TEXT, HELP_TEXT, LLM_FALLBACK_TEXT, NON_TEXT_TEXT,
     ORDER_INTENT_RE, RATE_LIMITED_TEXT, TOO_LONG_TEXT,
 };
+use crate::topics::{self, Topic};
 use crate::forms::{self, FormKind, Reply};
 use crate::state::App;
 use crate::{events, orders};
@@ -124,16 +127,18 @@ async fn respond(app: &App, inc: &Incoming) -> Result<()> {
 
     // 9) Handoff keywords -> short message, pause, Telegram.
     if HANDOFF_RE.is_match(text) {
-        app.db.set_paused(psid, true)?;
-        let name = app.db.get_user_name(psid).unwrap_or_default();
-        let notifier = app.notifier.clone();
-        let (p, t) = (psid.to_string(), text.to_string());
-        tokio::spawn(async move { notifier.notify_handoff(&p, &name, &t).await });
-        app.send(psid, &Reply::text(HANDOFF_TEXT)).await;
+        handoff(app, psid, text).await?;
         return Ok(());
     }
 
-    // 10) Intent -> start a form (AFTER handoff, so "bulk orders" still reaches the team).
+    // 10) Reservations for regular seating: walk-in only. Checked BEFORE the booking intent
+    //     so "mag-reserve ng table" never opens the event form.
+    if topics::is_reservation(text) {
+        app.send(psid, &topics::reply(app, Topic::Reservations)).await;
+        return Ok(());
+    }
+
+    // 11) Intent -> start a form (AFTER handoff, so "bulk orders" still reaches the team).
     if ORDER_INTENT_RE.is_match(text) {
         app.send(psid, &orders::start_form(app, psid)).await;
         return Ok(());
@@ -143,7 +148,18 @@ async fn respond(app: &App, inc: &Incoming) -> Result<()> {
         return Ok(());
     }
 
-    // 11) Keyword/regex FAQ.
+    // 12) Loyalty program / private events (deterministic answers).
+    if let Some(topic) = topics::detect(text) {
+        if topic == Topic::NeedsTeam {
+            // Lost points, a missing stamp or an app problem -> the team checks it.
+            handoff(app, psid, text).await?;
+            return Ok(());
+        }
+        app.send(psid, &topics::reply(app, topic)).await;
+        return Ok(());
+    }
+
+    // 13) Keyword/regex FAQ.
     if let Some(entry) = app.faq.match_text(text) {
         if !entry.answer.is_empty() {
             app.send(psid, &Reply::new(entry.answer.clone(), entry.quick_reply_pairs())).await;
@@ -151,7 +167,7 @@ async fn respond(app: &App, inc: &Incoming) -> Result<()> {
         }
     }
 
-    // 12) LLM fallback.
+    // 14) LLM fallback.
     if let Some(llm) = &app.llm {
         if let Some(answer) = llm.generate(&app.faq, text).await {
             app.send(psid, &Reply::text(answer)).await;
@@ -159,6 +175,17 @@ async fn respond(app: &App, inc: &Incoming) -> Result<()> {
         }
     }
     app.send(psid, &Reply::text(LLM_FALLBACK_TEXT)).await;
+    Ok(())
+}
+
+/// Pause the customer and let the team take over the conversation.
+async fn handoff(app: &App, psid: &str, text: &str) -> Result<()> {
+    app.db.set_paused(psid, true)?;
+    let name = app.db.get_user_name(psid).unwrap_or_default();
+    let notifier = app.notifier.clone();
+    let (p, t) = (psid.to_string(), text.to_string());
+    tokio::spawn(async move { notifier.notify_handoff(&p, &name, &t).await });
+    app.send(psid, &Reply::text(HANDOFF_TEXT)).await;
     Ok(())
 }
 
@@ -338,6 +365,35 @@ mod tests {
         assert_eq!(step(&app, u).as_deref(), Some("order_confirm"));
         process(&app, msg(u, "a5", "sige")).await.unwrap();
         assert_eq!(step(&app, u).as_deref(), Some("order_name"));
+    }
+
+    #[tokio::test]
+    async fn topics_answer_without_starting_forms() {
+        let app = App::for_test();
+
+        // Reservations: walk-in only, and the event form is NOT started.
+        process(&app, msg("t1", "r1", "pwede mag-reserve ng table?")).await.unwrap();
+        assert_eq!(step(&app, "t1"), None);
+
+        // Private events: information only, no form.
+        process(&app, msg("t2", "e1", "may events ba kayo?")).await.unwrap();
+        assert_eq!(step(&app, "t2"), None);
+
+        // Loyalty: information only, no form and no pause.
+        process(&app, msg("t3", "l1", "may loyalty card ba kayo?")).await.unwrap();
+        assert_eq!(step(&app, "t3"), None);
+        assert!(!app.db.get_paused("t3").unwrap());
+
+        // A booking intent still opens the event form.
+        process(&app, msg("t4", "b1", "mag-book po kayo for birthday")).await.unwrap();
+        assert_eq!(step(&app, "t4").as_deref(), Some("event_type"));
+    }
+
+    #[tokio::test]
+    async fn loyalty_problems_are_handed_to_the_team() {
+        let app = App::for_test();
+        process(&app, msg("t5", "p1", "nawala po yung points ko")).await.unwrap();
+        assert!(app.db.get_paused("t5").unwrap());
     }
 
     #[tokio::test]
