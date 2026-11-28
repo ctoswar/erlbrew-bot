@@ -82,6 +82,19 @@ pub async fn handle_input(app: &App, psid: &str, raw: &str) -> Option<Reply> {
 // Internals
 // --------------------------------------------------------------------------
 
+/// Gentle reminder of the next step, used when the customer sends an acknowledgement while the
+/// event form is still open.
+pub fn step_hint(step: &str) -> &'static str {
+    match step {
+        "event_type" => "Para sa booking, i-tap lang po ang tipo ng event 👇",
+        "event_when" => "Para sa booking, isulat lang po ang petsa at oras 👇",
+        "event_guests" => "Para sa booking, ilagay lang po ang bilang ng guests 👇",
+        "event_name" => "Para sa booking, isulat lang po ang pangalan 👇",
+        "event_contact" => "Para sa booking, isulat lang po ang mobile number 👇",
+        _ => "Para sa booking, i-continue lang po natin ang form 👇",
+    }
+}
+
 fn next_step(step: &str) -> &'static str {
     match step {
         "event_type" => "event_when",

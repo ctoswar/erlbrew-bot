@@ -105,6 +105,24 @@ pub async fn handle_input(app: &App, psid: &str, raw: &str) -> Option<Reply> {
     }
 }
 
+/// True when the input is an explicit "yes" for the receipt (ok / sige / opo / …).
+pub fn is_confirm_yes(raw: &str) -> bool {
+    confirm_intent(raw) == Confirm::Ok
+}
+
+/// Gentle reminder of the next step, used when the customer sends an acknowledgement while the
+/// order form is still open.
+pub fn step_hint(step: &str) -> &'static str {
+    match step {
+        "order_items" => "Para sa order, isulat lang po ang items 👇",
+        "order_confirm" => "Para sa order, i-tap lang po ang 'Tama po' button 👇",
+        "order_name" => "Para sa order, isulat lang po ang pangalan 👇",
+        "order_address" => "Para sa order, isulat lang po ang address 👇",
+        "order_contact" => "Para sa order, isulat lang po ang mobile number 👇",
+        _ => "Para sa order, i-continue lang po natin ang form 👇",
+    }
+}
+
 // --------------------------------------------------------------------------
 // Internals
 // --------------------------------------------------------------------------

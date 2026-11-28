@@ -4,6 +4,7 @@
 //! and the modules are exposed so integration tests can drive the pipeline
 //! directly without a network.
 
+pub mod acks;
 pub mod config;
 pub mod db;
 pub mod events;

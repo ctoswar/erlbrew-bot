@@ -1,5 +1,6 @@
 //! Erlbrew Café — Facebook Messenger webhook service (native Rust).
 
+mod acks;
 mod config;
 mod db;
 mod events;
@@ -64,7 +65,17 @@ fn build_app(settings: Settings) -> Result<state::App> {
         tokio::spawn(async move { llm.warm_up().await });
     }
 
-    Ok(state::App { settings, db, faq, messenger, notifier, menu, llm, started: Instant::now() })
+    Ok(state::App {
+        settings,
+        db,
+        faq,
+        messenger,
+        notifier,
+        menu,
+        llm,
+        started: Instant::now(),
+        ack_counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
 }
 
 async fn shutdown_signal() {

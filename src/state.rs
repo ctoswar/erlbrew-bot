@@ -8,6 +8,7 @@ use crate::llm::Llm;
 use crate::menu::MenuCache;
 use crate::messenger::Messenger;
 use crate::notify::Notifier;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::error;
@@ -22,6 +23,8 @@ pub struct App {
     pub menu: Arc<MenuCache>,
     pub llm: Option<Arc<Llm>>,
     pub started: Instant,
+    /// Rotates the closing lines so the same acknowledgement is not answered identically.
+    pub ack_counter: Arc<AtomicUsize>,
 }
 
 impl App {
@@ -54,6 +57,7 @@ impl App {
             menu: Arc::new(MenuCache::new(settings.clone())),
             llm: None,
             started: Instant::now(),
+            ack_counter: Arc::new(AtomicUsize::new(0)),
             settings,
             db,
         }

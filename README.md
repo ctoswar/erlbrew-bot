@@ -30,6 +30,11 @@ Cloudflare Tunnel ──► this service (Rust/axum, Docker container)
 - Echo filtering, **dedupe by message id** (SQLite), per-user rate limit
   (15 msgs / 10 min) and 500-char cap — one polite notice, then silence.
 - Paused users (human handoff) get **no automatic replies** at all.
+- **Acknowledgements & closings**: "thank you", "salamat", "ty", "ok", "okay", "sige", "noted",
+  "got it", "alright", 👍 🙏 → **one** short warm Taglish line (rotating, one emoji max).
+  The welcome message, the hours/WiFi intro and "How can I help you today?" are never repeated,
+  and the LLM is not consulted. If a booking/order form is still open, the line also carries a
+  gentle reminder of the next step ("Para sa order, isulat lang po ang items 👇").
 - **Human takeover**: when a page admin replies from the Page inbox, the bot
   pauses that conversation (and cancels any half-finished form) so it never
   talks over the team. Resume with `POST /admin/unpause/{psid}`.
@@ -72,6 +77,7 @@ Cloudflare Tunnel ──► this service (Rust/axum, Docker container)
 | `src/messenger.rs` | Graph API send side + typing keeper |
 | `src/faq.rs` | hot-reloading FAQ engine |
 | `src/forms.rs` | shared form helpers (reply type, validation, cancel) |
+| `src/acks.rs` | acknowledgement / closing detection + rotating closing lines |
 | `src/events.rs` | event booking state machine |
 | `src/orders.rs` | order intake state machine |
 | `src/menu.rs` | live POS menu reader (read-only MySQL, TTL cache, fuzzy matcher) |

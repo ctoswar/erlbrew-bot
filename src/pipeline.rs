@@ -5,12 +5,14 @@
 //!   4. 500-char text cap
 //!   5. Paused users get no replies
 //!   6. Quick-reply / postback payloads
-//!   7. Active event/order form continues
-//!   8. Handoff keywords -> pause + Telegram
-//!   9. Order / event intent starts a form
-//!  10. Keyword/regex FAQ match
-//!  11. LLM fallback
+//!   7. Acknowledgements / closings ("thank you", "ok", 👍) -> one warm line
+//!   8. Active event/order form continues
+//!   9. Handoff keywords -> pause + Telegram
+//!  10. Order / event intent starts a form
+//!  11. Keyword/regex FAQ match
+//!  12. LLM fallback
 
+use crate::acks;
 use crate::config::{
     EVENT_INTENT_RE, HANDOFF_RE, HANDOFF_TEXT, HELP_TEXT, LLM_FALLBACK_TEXT, NON_TEXT_TEXT,
     ORDER_INTENT_RE, RATE_LIMITED_TEXT, TOO_LONG_TEXT,
@@ -97,13 +99,30 @@ async fn respond(app: &App, inc: &Incoming) -> Result<()> {
         return Ok(());
     }
 
-    // 7) An active form continues (form before handoff keywords).
+    // 7) Acknowledgements / closings ("thank you", "ok", "sige", 👍).
+    // One warm line, never the welcome message and never another "How can I help?".
+    if let Some(ack) = acks::detect(text) {
+        // While the receipt waits for confirmation, "ok"/"sige" means YES — the order form
+        // handles it instead of closing the conversation.
+        let confirm_pending = app
+            .db
+            .get_form(psid)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.step == "order_confirm");
+        if !(confirm_pending && orders::is_confirm_yes(text)) {
+            app.send(psid, &acks::reply(app, psid, ack)).await;
+            return Ok(());
+        }
+    }
+
+    // 8) An active form continues (form before handoff keywords).
     if let Some(reply) = continue_form(app, psid, text).await {
         app.send(psid, &reply).await;
         return Ok(());
     }
 
-    // 8) Handoff keywords -> short message, pause, Telegram.
+    // 9) Handoff keywords -> short message, pause, Telegram.
     if HANDOFF_RE.is_match(text) {
         app.db.set_paused(psid, true)?;
         let name = app.db.get_user_name(psid).unwrap_or_default();
@@ -114,7 +133,7 @@ async fn respond(app: &App, inc: &Incoming) -> Result<()> {
         return Ok(());
     }
 
-    // 9) Intent -> start a form (AFTER handoff, so "bulk orders" still reaches the team).
+    // 10) Intent -> start a form (AFTER handoff, so "bulk orders" still reaches the team).
     if ORDER_INTENT_RE.is_match(text) {
         app.send(psid, &orders::start_form(app, psid)).await;
         return Ok(());
@@ -124,7 +143,7 @@ async fn respond(app: &App, inc: &Incoming) -> Result<()> {
         return Ok(());
     }
 
-    // 10) Keyword/regex FAQ.
+    // 11) Keyword/regex FAQ.
     if let Some(entry) = app.faq.match_text(text) {
         if !entry.answer.is_empty() {
             app.send(psid, &Reply::new(entry.answer.clone(), entry.quick_reply_pairs())).await;
@@ -132,7 +151,7 @@ async fn respond(app: &App, inc: &Incoming) -> Result<()> {
         }
     }
 
-    // 11) LLM fallback.
+    // 12) LLM fallback.
     if let Some(llm) = &app.llm {
         if let Some(answer) = llm.generate(&app.faq, text).await {
             app.send(psid, &Reply::text(answer)).await;
@@ -297,6 +316,28 @@ mod tests {
         process(&app, msg("user6", "k1", "bulk orders po for office")).await.unwrap();
         assert!(app.db.get_paused("user6").unwrap());
         assert_eq!(step(&app, "user6"), None);
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_closes_warmly_and_keeps_forms_open() {
+        let app = App::for_test();
+        let u = "ack-user";
+
+        // A plain closing does not start a form and does not pause the customer.
+        process(&app, msg(u, "a1", "salamat po")).await.unwrap();
+        assert_eq!(step(&app, u), None);
+        assert!(!app.db.get_paused(u).unwrap());
+
+        // An acknowledgement inside a form keeps the form open (no "gave up" counter).
+        process(&app, msg(u, "a2", "order")).await.unwrap();
+        process(&app, msg(u, "a3", "ok")).await.unwrap();
+        assert_eq!(step(&app, u).as_deref(), Some("order_items"));
+
+        // "ok" while the receipt waits still means YES.
+        process(&app, msg(u, "a4", "2 iced latte")).await.unwrap();
+        assert_eq!(step(&app, u).as_deref(), Some("order_confirm"));
+        process(&app, msg(u, "a5", "sige")).await.unwrap();
+        assert_eq!(step(&app, u).as_deref(), Some("order_name"));
     }
 
     #[tokio::test]
