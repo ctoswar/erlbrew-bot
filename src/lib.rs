@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod events;
 pub mod faq;
+pub mod forms;
 pub mod llm;
 pub mod menu;
 pub mod messenger;

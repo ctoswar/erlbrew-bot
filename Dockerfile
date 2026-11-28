@@ -1,31 +1,50 @@
-FROM python:3.12-slim
+# Build stage: compile the Rust binary
+FROM rust:1-bookworm AS builder
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy Cargo files first for layer caching
+COPY Cargo.toml Cargo.lock ./
 
-# App code + bundled fallback copies of faq.yaml / knowledge.md
-COPY main.py config.py db.py messenger.py faq.py events.py llm.py notify.py orders.py menu.py ./
+# Copy source code
+COPY src ./src
+
+# Build in release mode
+RUN cargo build --release
+
+# ==========================
+# Runtime stage
+# ==========================
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Data directory for the SQLite database (bind-mounted in docker-compose)
+RUN mkdir -p /app/data
+
+# Copy the compiled binary from the builder stage
+COPY --from=builder /app/target/release/erlbrew-bot /usr/local/bin/bot
+
+# Copy editable content (live-editable via bind-mount in docker-compose)
 COPY faq.yaml knowledge.md ./
 
-# Non-root user; ./data is expected to be a bind-mounted volume for the live-editable
-# faq.yaml / knowledge.md / erlbrew.db
-RUN useradd --system --no-create-home bot \
-    && mkdir -p /app/data \
-    && chown -R bot:bot /app
-USER bot
-
+# Expose the port
 EXPOSE 8000
 
+# Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=2 \
-    CMD python -c "import urllib.request,sys;\
-r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4);\
-sys.exit(0 if r.status==200 else 1)" || exit 1
+    CMD ["/usr/local/bin/bot", "--health-check"]
 
-# `serve` runs uvicorn (single worker, low memory); `unpause <PSID>` is the CLI.
-CMD ["python", "main.py", "serve"]
+# Run the bot
+CMD ["/usr/local/bin/bot"]

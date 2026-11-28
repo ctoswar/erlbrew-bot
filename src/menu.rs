@@ -1,94 +1,148 @@
 //! Live POS menu lookups for order intake.
 //!
-//! The café's menu lives in the POS database (`erlbrew_pos.menu_items`). When a
-//! customer orders, the bot quotes REAL prices from there so the team doesn't
-//! have to re-type them in chat. Prices can change any day, so we read the live
-//! DB with a short TTL cache (MENU_CACHE_TTL_SEC, default 60s) — the live menu
-//! already diverged from the SQL backup, a snapshot would go stale immediately.
+//! The café's menu lives in the POS database. When a customer orders, the bot quotes REAL
+//! prices from there so the team doesn't have to re-type them in chat. Prices can change any
+//! day, so the menu is read live with a short TTL cache (MENU_CACHE_TTL_SEC, default 60s).
 //!
-//! Design rules (kept from the original):
-//! - NEVER invents a price: when the DB is unreachable or nothing matches, the
-//!   receipt simply has no price info and the team confirms totals as usual.
-//! - Menu rows that carry the drink size in the NAME ("DARK MOCHA 8OZ") or in
-//!   the DESCRIPTION ("8oz") are grouped into one base drink so "white choco
-//!   mocha" can resolve to its 8oz/12oz/16oz variants.
-//! - Fuzzy matching (difflib >= 0.75) handles casual spellings: "white choco
-//!   mocha" -> "WHITE CHOCOLATE MOCHA".
-//! - No asyncio.Lock on the cache: races at most fire one extra SELECT, which is
-//!   harmless.
-//!
-//! The absolute rule stands: totals are ESTIMATES ONLY — the team always
-//! confirms the final total in the chat.
+//! Rules:
+//! - NEVER invents a price: when the DB is unreachable or nothing matches, the receipt simply
+//!   has no price info and the team confirms totals as usual.
+//! - Rows carrying the drink size in the NAME ("DARK MOCHA 8OZ") or DESCRIPTION ("8oz") are
+//!   grouped into one base drink, so "white choco mocha" can resolve to its 8oz/16oz variants.
+//! - Fuzzy matching (Ratcliff/Obershelp ratio >= 0.75, same as Python's difflib) handles casual
+//!   spellings: "white choco mocha" -> "WHITE CHOCOLATE MOCHA".
+//! - Totals are ESTIMATES ONLY — the team always confirms the final total in chat.
 
 use crate::config::Settings;
-use crate::db::Db;
-use anyhow::{bail, Result};
-use difflib::SequenceMatcher;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tracing::{debug, info, warn};
-use uuid::Uuid;
+use anyhow::{Context, Result};
+use mysql_async::prelude::*;
+use regex::Regex;
+use serde::Serialize;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
-/// Normalized text: lowercase, strip non-word chars, collapse whitespace.
+pub const FUZZY_THRESHOLD: f64 = 0.75;
+
+static NON_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^\w\s]").unwrap());
+static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(\d{1,2})\s*oz\b").unwrap());
+static TEMP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(iced|hot|cold|frappe|blended)\b").unwrap());
+static SPLIT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[,;\n+]|\band\b|\bat\b").unwrap());
+static QTY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d{1,3})\s*(.*)$").unwrap());
+static UNIT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:pcs?|pieces?|x|×)\s*").unwrap());
+
+// ---------------------------------------------------------------------------
+// Text helpers
+// ---------------------------------------------------------------------------
+
+/// Lowercase, strip non-word chars, collapse whitespace.
 pub fn normalize(text: &str) -> String {
-    let nonword = regex::Regex::new(r"[^\w\s]")
-        .expect("regex compile")
-        .replace_all(text, " ");
-    " ".join(nonword.lines().next().unwrap_or(&text).split_whitespace()).to_lowercase()
+    let lower = text.to_lowercase();
+    let cleaned = NON_WORD.replace_all(&lower, " ");
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Extract size in oz from text like "8oz", "16 oz", etc.
+/// "8oz", "16 oz" -> Some("8oz") / Some("16oz").
 pub fn extract_size(text: &str) -> Option<String> {
-    let re = regex::Regex::new(r"\b(\d{1,2})\s*oz\b")
-        .expect("regex compile");
-    re.captures(text)?
-        .get(1)?
-        .as_str()
-        .parse::<u16>()
-        .ok()
-        .map(|n| format!("{}oz", n))
+    let lower = text.to_lowercase();
+    let n: u16 = SIZE_RE.captures(&lower)?.get(1)?.as_str().parse().ok()?;
+    Some(format!("{n}oz"))
 }
 
-/// Strip size and temperature tokens to get the base drink key.
+/// Drop size and temperature words to get the base drink key.
 pub fn strip_size_and_temp(text: &str) -> String {
     let low = normalize(text);
-    let size_re = regex::Regex::new(r"\b(\d{1,2})\s*oz\b")
-        .expect("regex compile");
-    let low = size_re.replace_all(&low, " ");
-    let temp_re = regex::Regex::new(r"\b(iced|hot|cold|frappe|blended)\b")
-        .expect("regex compile");
-    let low = temp_re.replace_all(&low, " ");
-    " ".join(low.split_whitespace()).to_lowercase()
+    let low = SIZE_RE.replace_all(&low, " ");
+    let low = TEMP_RE.replace_all(&low, " ");
+    low.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Temperature hint from text: true=iced/cold, false=hot, None=unspecified.
+/// Some(true) = iced/cold, Some(false) = hot, None = unspecified.
 pub fn temperature_of(text: &str) -> Option<bool> {
-    let low = text.to_lowercase();
-    if low.contains("iced") || low.contains("cold") || low.contains("frappe") || low.contains("blended") {
-        return Some(true);
+    let low = normalize(text);
+    let has = |w: &str| low.split_whitespace().any(|t| t == w);
+    if has("iced") || has("cold") || has("frappe") || has("blended") {
+        Some(true)
+    } else if has("hot") {
+        Some(false)
+    } else {
+        None
     }
-    if low.contains("hot") {
-        return Some(false);
-    }
-    None
 }
 
-/// Format a price float: ₱129 -> "129", ₱129.50 -> "129.50"
+/// 129.0 -> "129", 129.5 -> "129.50".
 pub fn fmt_price(value: f64) -> String {
     if (value - value.round()).abs() < 0.005 {
-        return format!("{}", value.round());
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value:.2}")
     }
-    format!("{:.2f}", value)
 }
 
-/// A menu item as stored in the POS DB.
+fn title_case(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Ratcliff/Obershelp similarity (what Python's `difflib.SequenceMatcher.ratio()` computes).
+pub fn ratio(a: &str, b: &str) -> f64 {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let total = a.len() + b.len();
+    if total == 0 {
+        return 1.0;
+    }
+    2.0 * matching_chars(&a, &b) as f64 / total as f64
+}
+
+fn matching_chars(a: &[char], b: &[char]) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    // Longest common substring (earliest in `a`, then earliest in `b`).
+    let (mut best, mut ai, mut bi) = (0usize, 0usize, 0usize);
+    let mut prev = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        let mut cur = vec![0usize; b.len() + 1];
+        for j in 1..=b.len() {
+            if a[i - 1] == b[j - 1] {
+                cur[j] = prev[j - 1] + 1;
+                if cur[j] > best {
+                    best = cur[j];
+                    ai = i - best;
+                    bi = j - best;
+                }
+            }
+        }
+        prev = cur;
+    }
+    if best == 0 {
+        return 0;
+    }
+    best + matching_chars(&a[..ai], &b[..bi]) + matching_chars(&a[ai + best..], &b[bi + best..])
+}
+
+// ---------------------------------------------------------------------------
+// Menu model
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MenuItem {
     pub item_id: String,
     pub name: String,
     pub category: String,
     pub price: f64,
-    pub description: String,
     pub popular: bool,
     pub norm: String,
     pub base: String,
@@ -97,23 +151,17 @@ pub struct MenuItem {
 }
 
 impl MenuItem {
-    /// Display name with size appended when not already visible.
+    /// Display name, with the size appended when it isn't already visible in the name.
     pub fn display(&self) -> String {
-        let mut name = self.name.trim().to_string();
-        if !self.size.is_empty()
-            && !re(// regex check
-                r"\d+\s*oz",
-                regex::Regex::new(r"\d+\s*oz")
-                    .expect("regex")
-                    .is_match(&name)
-            )
-        {
-            name = format!("{} ({})", name, self.size.to_uppercase());
+        let name = self.name.trim().to_string();
+        if !self.size.is_empty() && !SIZE_RE.is_match(&name.to_lowercase()) {
+            format!("{} ({})", name, self.size.to_uppercase())
+        } else {
+            name
         }
-        name
     }
 
-    /// Short label for alternates, e.g. "iced 16oz" or "hot".
+    /// Short label for alternates, e.g. "iced 16oz" or "hot pastries".
     pub fn variant_label(&self) -> String {
         let temp = match self.temp {
             Some(true) => "iced ",
@@ -121,24 +169,21 @@ impl MenuItem {
             None => "",
         };
         if !self.size.is_empty() {
-            format!("{}{}", temp, self.size)
+            return format!("{temp}{}", self.size);
+        }
+        let label = [self.category.trim(), self.norm.trim(), self.name.trim()]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_lowercase();
+        if self.temp == Some(false) {
+            format!("hot {label}")
         } else {
-            let label = self
-                .category
-                .trim()
-                .to_lowercase()
-                .or_else(|| Some(self.norm.trim().to_lowercase().or_else(|| Some(self.name.trim().to_lowercase())).flatten().unwrap_or_default())
-            );
-            if self.temp == Some(false) {
-                format!("hot {}", label)
-            } else {
-                label
-            }
+            label
         }
     }
 }
 
-/// Receipt built from matched items.
 #[derive(Clone, Debug, Default)]
 pub struct Receipt {
     pub lines: Vec<String>,
@@ -147,444 +192,304 @@ pub struct Receipt {
     pub alternates: Vec<String>,
 }
 
-impl Receipt {
-    pub fn ok(&self) -> bool {
-        !self.lines.is_empty()
-    }
+/// One row from the POS `menu_items` query.
+struct MenuRow {
+    id: String,
+    name: String,
+    category: String,
+    price: f64,
+    description: String,
+    popular: bool,
 }
 
-/// Match a single food phrase against the menu.
+fn rows_to_items(rows: Vec<MenuRow>) -> Vec<MenuItem> {
+    rows.into_iter()
+        .filter(|r| !r.name.trim().is_empty() && r.price > 0.0)
+        .map(|r| MenuItem {
+            size: extract_size(&r.name).or_else(|| extract_size(&r.description)).unwrap_or_default(),
+            norm: normalize(&r.name),
+            base: strip_size_and_temp(&r.name),
+            temp: temperature_of(&r.name),
+            item_id: r.id,
+            name: r.name,
+            category: r.category,
+            price: r.price,
+            popular: r.popular,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Matching
+// ---------------------------------------------------------------------------
+
+fn match_score(query: &str, row: &MenuItem, q_temp: Option<bool>) -> f64 {
+    let mut s = ratio(query, &row.norm).max(ratio(query, &row.base));
+    // Containment boost, conservative: only for >= 5-char queries.
+    if query.chars().count() >= 5 && (row.norm.contains(query) || query.contains(&row.norm)) {
+        s = s.max(0.76);
+    }
+    if let (Some(q), Some(r)) = (q_temp, row.temp) {
+        s += if q == r { 0.03 } else { -0.03 };
+    }
+    s
+}
+
+/// Match one food phrase against the menu.
 pub fn best_match(query: &str, menu: &[MenuItem]) -> Option<MenuItem> {
     let q = normalize(query);
     if q.is_empty() {
         return None;
     }
-
     let q_temp = temperature_of(&q);
-    let mut best: Option<MenuItem> = None;
-    let mut best_score = 0.0f64;
 
+    let mut best: Option<(&MenuItem, f64)> = None;
     for row in menu {
-        let score = _match_score(&q, row, q_temp);
-        if score > best_score {
-            best_score = score;
-            best = Some(row.clone());
+        let score = match_score(&q, row, q_temp);
+        if best.is_none_or(|(_, b)| score > b) {
+            best = Some((row, score));
         }
     }
-
-    if best.is_none() || best_score < FUZZY_THRESHOLD {
+    let (best, score) = best?;
+    if score < FUZZY_THRESHOLD {
         return None;
     }
 
-    // If the customer named a size, prefer that variant within the matched drink's family.
-    if let Some(size_m) = extract_size(&q) {
-        let wanted = format!("{}oz", size_m.parse::<u16>().unwrap_or(0));
-        let sized: Vec<MenuItem> = menu
-            .iter()
-            .filter(|r| r.base == best.as_ref()?.base && r.size == wanted)
-            .cloned()
-            .collect();
-        if !sized.is_empty() {
-            return Some(sized[0].clone());
+    // If the customer named a size, prefer that variant of the same base drink.
+    if let Some(wanted) = extract_size(&q) {
+        if let Some(sized) = menu.iter().find(|r| r.base == best.base && r.size == wanted) {
+            return Some(sized.clone());
         }
     }
-    best
+    Some(best.clone())
 }
 
-/// Score a single menu item against a normalized query.
-fn _match_score(query: &str, row: &MenuItem, q_temp: Option<bool>) -> f64 {
-    let s = max(
-        SequenceMatcher::new(query, &row.norm).ratio(),
-        SequenceMatcher::new(query, &row.base).ratio(),
-    );
-
-    // Containment boost, conservative: only for >=5-char queries.
-    if query.len() >= 5 && (query.contains(&row.norm) || row.norm.contains(query)) {
-        let _ = max(s, 0.76f64);
-    }
-    if q_temp.is_some() && row.temp.is_some() {
-        if q_temp == row.temp {
-            // +0.03 temperature agreement
-        } else {
-            // -0.03 temperature mismatch
-        }
-    }
-    s
-}
-
-/// Parse a free-text order string into (quantity, food-phrase) pairs.
+/// "2 iced latte + 1 cookie" -> [(2, "iced latte"), (1, "cookie")].
 pub fn parse_items(text: &str) -> Vec<(u16, String)> {
-    let out = regex::Regex::new(r"[,;\\n+]|\band\b|\bat\b", regex::Regex::Flags::default())
-        .expect("regex compile")
+    SPLIT_RE
         .split(text)
-        .map(|chunk| {
+        .filter_map(|chunk| {
             let raw = chunk.trim();
             if raw.is_empty() {
-                return (1, raw.into());
+                return None;
             }
-            let mut qty: u16 = 1;
-            let rest = raw;
-            // Leading number
-            if let Some(cap) = regex::Regex::new(r"^(\d{1,3})\s*(.*)$")
-                .expect("regex compile")
-                .captures(raw)
-            {
-                qty = cap[1].parse().unwrap_or(1).min(99);
-                let rest = cap.get(2).map(|g| g.as_str().trim()).unwrap_or("");
-            }
-            // Strip pcs/x/size markers
-            let rest = regex::Regex::new(r"^(?:pcs?|pieces?|x|×)\s*", regex::Regex::Flags::default())
-                .expect("regex compile")
-                .replace_all(rest, "");
-            // Strip sizes (they don't help matching)
-            let rest = regex::Regex::new(r"\b(\d{1,2})\s*oz\b", regex::Regex::Flags::default())
-                .expect("regex compile")
-                .replace_all(&rest, "");
-            // Fallback: keep last word
-            let rest = if rest.trim().is_empty() {
-                raw.split_whitespace().last().unwrap_or("").into()
-            } else {
-                rest.into()
+            let (qty, rest) = match QTY_RE.captures(raw) {
+                Some(cap) => (
+                    cap[1].parse::<u16>().unwrap_or(1).clamp(1, 99),
+                    cap[2].trim().to_string(),
+                ),
+                None => (1, raw.to_string()),
             };
-            (qty, rest.into())
+            let rest = UNIT_RE.replace(&rest, "").to_string();
+            // Sizes don't help matching.
+            let rest = SIZE_RE.replace_all(&rest, "").trim().to_string();
+            let rest = if rest.is_empty() {
+                raw.split_whitespace().last().unwrap_or("").to_string()
+            } else {
+                rest
+            };
+            (!rest.is_empty()).then_some((qty, rest))
         })
-        .filter(|(_, r)| !r.trim().is_empty())
-        .collect::<Vec<_>>();
-    out
+        .collect()
 }
 
-/// Build a priced receipt from free-text items.
-pub async fn build_receipt(
-    db: &Db,
-    raw_items: &str,
-) -> Result<Receipt, anyhow::Error> {
+/// Build a priced receipt from free-text items. Pure: no I/O.
+pub fn build_receipt(menu: &[MenuItem], raw_items: &str) -> Receipt {
     let raw = raw_items.trim();
-    let menu = get_menu(db).await?;
-
+    let unpriced = || Receipt {
+        lines: if raw.is_empty() { vec![] } else { vec![raw.to_string()] },
+        ..Receipt::default()
+    };
     if menu.is_empty() {
-        return Ok(Receipt {
-            lines: if !raw.is_empty() {
-                vec![raw.into()]
-            } else {
-                vec![]
-            },
-            total: 0.0,
-            has_prices: false,
-            alternates: vec![],
-        });
+        return unpriced();
     }
 
-    let mut lines: Vec<String> = Vec::new();
-    let mut alternates: Vec<String> = Vec::new();
-    let mut total: f64 = 0.0;
-    let mut has_prices = false;
-
+    let mut receipt = Receipt::default();
     for (qty, food) in parse_items(raw) {
-        let item = best_match(&food, &menu);
-        if item.is_none() {
-            lines.push(format!("{}× {} — (presyo titingnan ng team)", qty, food.title_case()));
+        let Some(item) = best_match(&food, menu) else {
+            receipt
+                .lines
+                .push(format!("{qty}× {} — (presyo titingnan ng team)", title_case(&food)));
             continue;
-        }
-        has_prices = true;
-        let item = item.unwrap();
-        let line_total = qty as f64 * item.price;
-        total += line_total;
-        lines.push(format!("{}× {} — ₱{}", qty, item.display(), fmt_price(line_total)));
+        };
+        receipt.has_prices = true;
+        let line_total = f64::from(qty) * item.price;
+        receipt.total += line_total;
+        receipt.lines.push(format!("{qty}× {} — ₱{}", item.display(), fmt_price(line_total)));
 
-        // Siblings: other sizes/variants of the same base drink
-        let sibs: Vec<MenuItem> = menu
+        let labels: Vec<String> = menu
             .iter()
             .filter(|s| s.base == item.base && s.item_id != item.item_id)
-            .cloned()
+            .map(|s| format!("{} ₱{}", s.variant_label(), fmt_price(s.price)))
             .collect();
-        if !sibs.is_empty() {
-            let labels: Vec<String> = sibs
-                .iter()
-                .map(|s| format!("{} ₱{}", s.variant_label(), fmt_price(s.price)))
-                .collect();
-            alternates.push(format!(
+        if !labels.is_empty() {
+            receipt.alternates.push(format!(
                 "(May ibang sizes po: {} — sabihin lang po kung palit.)",
                 labels.join(", ")
             ));
         }
     }
 
-    if lines.is_empty() {
-        return Ok(Receipt {
-            lines: if !raw.is_empty() {
-                vec![raw.into()]
-            } else {
-                vec![]
-            },
-            total: 0.0,
-            has_prices: false,
-            alternates: vec![],
-        });
+    if receipt.lines.is_empty() {
+        return unpriced();
     }
-
-    Ok(Receipt {
-        lines,
-        total: total.round(2.0),
-        has_prices,
-        alternates,
-    })
+    receipt.total = (receipt.total * 100.0).round() / 100.0;
+    receipt
 }
 
-/// In-memory cache + live fetch.
-#[derive(Clone)]
+// ---------------------------------------------------------------------------
+// Live cache
+// ---------------------------------------------------------------------------
+
+/// TTL cache over the POS menu. Races at most fire one extra SELECT, which is harmless.
 pub struct MenuCache {
-    db: Arc<Db>,
-    items: Vec<MenuItem>,
-    loaded_at: std::time::Instant,
+    settings: Arc<Settings>,
+    pool: Option<mysql_async::Pool>,
+    cached: Mutex<Option<(Instant, Arc<Vec<MenuItem>>)>>,
 }
 
 impl MenuCache {
-    pub fn new(db: Arc<Db>) -> Self {
-        Self {
-            db,
-            items: Vec::new(),
-            loaded_at: std::time::Instant::now(),
-        }
-    }
-
-    /// Force a fresh read from the DB, bypassing the TTL.
-    pub async fn refresh(&mut self) -> Result<(), anyhow::Error> {
-        let rows = self.fetch_rows().await?;
-        self.items = self.to_items(&rows)?;
-        self.loaded_at = std::time::Instant::now();
-        info!("menu loaded, count={}", self.items.len());
-        Ok(())
-    }
-
-    /// Return the cached menu, refreshing if TTL expired or cold start.
-    pub async fn get(&mut self) -> Result<&[MenuItem], anyhow::Error> {
-        let ttl = std::time::Duration::from_secs(60);
-        if !self.items.is_empty() && self.loaded_at.elapsed() < ttl {
-            return Ok(&self.items);
-        }
-        self.refresh().await
-    }
-
-    /// Internal: fetch one SELECT against the POS DB.
-    async fn fetch_rows(&self) -> Result<Vec<MenuRow>, anyhow::Error> {
-        // Try SQLite-stubbed menu rows if MySQL not configured
-        // (for tests / local dev without POS MySQL)
-        let path = std::path::Path::new(&config::settings::Settings::for_test().pos_mysql_url);
-        if !path.exists() || path.to_string_lossy().contains("localhost") || path.to_string_lossy().contains("127.0.0.1") {
-            // Return stubbed rows for testing — these are the same as _FAKE_MENU from tests
-            let stubbed = vec![
-                MenuRow {
-                    id: "H5".into(),
-                    name: "WHITE CHOCOLATE MOCHA".into(),
-                    category: "HOT COFFEE".into(),
-                    price: 129.0,
-                    description: "8oz".into(),
-                    popular: true,
-                },
-                MenuRow {
-                    id: "M4".into(),
-                    name: "ICED WHITE CHOCOLATE MOCHA".into(),
-                    category: "ICED COFFEE".into(),
-                    price: 169.0,
-                    description: "16oz".into(),
-                    popular: false,
-                },
-                MenuRow {
-                    id: "CS1".into(),
-                    name: "CHOCOLATE COOKIES".into(),
-                    category: "PASTRIES".into(),
-                    price: 85.0,
-                    description: "".into(),
-                    popular: false,
-                },
-            ];
-            return Ok(stubbed);
-        }
-        // Real MySQL fetch would go here; for now fallback to stubs
-        todo!("MySQL fetch not implemented in Rust rewrite stub")
-    }
-
-    /// Internal: normalize a row into a MenuItem.
-    fn to_items(&self, rows: &[MenuRow]) -> Result<Vec<MenuItem>, anyhow::Error> {
-        let mut items = Vec::new();
-        for r in rows {
-            let name = r.name.trim();
-            if name.is_empty() {
-                continue;
+    pub fn new(settings: Arc<Settings>) -> Self {
+        let pool = if settings.pos_mysql_url.is_empty() {
+            None
+        } else {
+            match mysql_async::Opts::from_url(&settings.pos_mysql_url) {
+                Ok(opts) => Some(mysql_async::Pool::new(opts)),
+                Err(err) => {
+                    warn!(error = %err, "POS_MYSQL_URL is invalid; orders will have no live prices");
+                    None
+                }
             }
-            let desc = &r.description;
-            let size = extract_size(&r.name).or_else(|| extract_size(desc)).unwrap_or_default();
-            let price = r.price;
-            if price <= 0.0 {
-                continue; // malformed row
+        };
+        Self { settings, pool, cached: Mutex::new(None) }
+    }
+
+    /// Cached or freshly fetched menu. Never fails: falls back to the stale copy, then to empty.
+    pub async fn get(&self) -> Arc<Vec<MenuItem>> {
+        let ttl = Duration::from_secs(self.settings.menu_cache_ttl_sec);
+        let stale = {
+            let guard = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some((at, items)) if !items.is_empty() && at.elapsed() < ttl => {
+                    return Arc::clone(items);
+                }
+                Some((_, items)) => Some(Arc::clone(items)),
+                None => None,
             }
-            let norm = normalize(&r.name);
-            let base = strip_size_and_temp(&r.name);
-            let temp = temperature_of(&r.name);
-            items.push(MenuItem {
-                item_id: r.id.clone(),
-                name: r.name.clone(),
-                category: r.category.clone(),
-                price,
-                size: size.clone(),
-                popular: r.popular,
-                norm,
-                base,
-                temp,
-            });
+        };
+
+        match tokio::time::timeout(Duration::from_secs(5), self.fetch()).await {
+            Ok(Ok(items)) => {
+                info!(count = items.len(), "menu loaded from POS");
+                let items = Arc::new(items);
+                *self.cached.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((Instant::now(), Arc::clone(&items)));
+                items
+            }
+            Ok(Err(err)) => {
+                warn!(error = %err, "POS menu fetch failed");
+                stale.unwrap_or_default()
+            }
+            Err(_) => {
+                warn!("POS menu fetch timed out");
+                stale.unwrap_or_default()
+            }
         }
-        Ok(items)
     }
-}
 
-/// Row from SQLite (used as stand-in for MySQL rows in tests).
-#[derive(Clone, Debug)]
-struct MenuRow {
-    pub id: String,
-    pub name: String,
-    pub category: String,
-    pub price: f64,
-    pub description: String,
-    pub popular: bool,
-}
-
-/// Fallback question text when no menu match
-const Q_TOTAL_NO_PRICES: &str = "(Presyo po — kakumpirmahin ng team ang exact total)";
-
-/// Full-text title-case for display
-fn title_case(s: &str) -> String {
-    let mut caps = true;
-    s.chars()
-        .map(|c| {
-            if caps && c.is_alphabetic() {
-                let uc = c.to_ascii_uppercase();
-                caps = false;
-                uc
-            } else if c == ' ' {
-                caps = true;
-                c
-            } else {
-                caps = false;
-                c.to_ascii_lowercase()
-            }
-        })
-        .collect()
-}
-
-/// Global TTL cache, shared across tasks.
-static mut MENU_CACHE: Option<MenuCache> = None;
-
-/// Get the global menu cache, initialising if needed.
-fn global_menu_cache(db: &Db) -> Result<&'static MenuCache, anyhow::Error> {
-    unsafe {
-        let cache = MENU_CACHE.get_or_insert_with(|| {
-            Box::leak(MenuCache::new(Arc::new(db.clone())))
-        });
-        Ok(cache)
+    async fn fetch(&self) -> Result<Vec<MenuItem>> {
+        let pool = self.pool.as_ref().context("POS_MYSQL_URL not configured")?;
+        let mut conn = pool.get_conn().await.context("connecting to POS database")?;
+        // Text protocol returns every column as bytes, which mysql_async converts for us.
+        let rows: Vec<(String, String, Option<String>, f64, Option<String>, Option<i64>)> =
+            conn.query(self.settings.pos_menu_query.as_str()).await.context("running menu query")?;
+        Ok(rows_to_items(
+            rows.into_iter()
+                .map(|(id, name, category, price, description, popular)| MenuRow {
+                    id,
+                    name,
+                    category: category.unwrap_or_default(),
+                    price,
+                    description: description.unwrap_or_default(),
+                    popular: popular.unwrap_or(0) != 0,
+                })
+                .collect(),
+        ))
     }
-}
 
-/// Async entry: returns cached or freshly-fetched menu.
-pub async fn get_menu(db: &Db) -> Result<Vec<MenuItem>, anyhow::Error> {
-    let cache = global_menu_cache(db)?;
-    cache.get().await
+    pub async fn build_receipt(&self, raw_items: &str) -> Receipt {
+        build_receipt(&self.get().await, raw_items)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Db;
-    use std::collections::HashMap;
 
-    #[test]
-    fn test_normalize() {
-        assert_eq!(normalize("WHITE CHOCOLATE MOCHA 8oz"), "white chocolate mocha 8oz");
-        assert_eq!(normalize("  hello   world  "), "hello world");
+    fn fake_menu() -> Vec<MenuItem> {
+        rows_to_items(vec![
+            MenuRow { id: "H5".into(), name: "WHITE CHOCOLATE MOCHA".into(), category: "HOT COFFEE".into(), price: 129.0, description: "8oz".into(), popular: true },
+            MenuRow { id: "M4".into(), name: "ICED WHITE CHOCOLATE MOCHA".into(), category: "ICED COFFEE".into(), price: 169.0, description: "16oz".into(), popular: false },
+            MenuRow { id: "CS1".into(), name: "CHOCOLATE COOKIES".into(), category: "PASTRIES".into(), price: 85.0, description: "".into(), popular: false },
+        ])
     }
 
     #[test]
-    fn test_extract_size() {
-        assert_eq!(extract_size("WHITE CHOCOLATE MOCHA 8oz"), Some("8oz".into()));
-        assert_eq!(extract_size("ICED LATTE 16oz"), Some("16oz".into()));
+    fn helpers() {
+        assert_eq!(normalize("  WHITE   CHOCOLATE, MOCHA 8oz "), "white chocolate mocha 8oz");
+        assert_eq!(extract_size("ICED LATTE 16 oz"), Some("16oz".into()));
         assert_eq!(extract_size("CAPPUCCINO"), None);
-    }
-
-    #[test]
-    fn test_temperature_of() {
         assert_eq!(temperature_of("ICED LATTE"), Some(true));
         assert_eq!(temperature_of("HOT CHOCOLATE"), Some(false));
-        assert_eq!(temperature_of("BLACK COFFEE"), None);
-    }
-
-    #[test]
-    fn test_fmt_price() {
+        assert_eq!(temperature_of("WHITE MOCHA"), None);
         assert_eq!(fmt_price(129.0), "129");
-        assert_eq!(fmt_price(169.50), "169.50");
-        assert_eq!(fmt_price(85.0), "85");
+        assert_eq!(fmt_price(169.5), "169.50");
+        assert_eq!(strip_size_and_temp("ICED White Mocha 16oz"), "white mocha");
     }
 
     #[test]
-    fn test_parse_items() {
-        let pairs = parse_items("2 iced white choco mocha + 1 banana bread");
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0], (2, "iced white choco mocha"));
-        assert_eq!(pairs[1], (1, "banana bread"));
+    fn ratio_matches_difflib() {
+        assert!((ratio("abcd", "bcde") - 0.75).abs() < 1e-9);
+        assert_eq!(ratio("same", "same"), 1.0);
+        assert_eq!(ratio("abc", "xyz"), 0.0);
     }
 
     #[test]
-    fn test_best_match() {
-        let menu = vec![
-            MenuItem {
-                item_id: "H5".into(),
-                name: "WHITE CHOCOLATE MOCHA".into(),
-                category: "HOT COFFEE".into(),
-                price: 129.0,
-                size: "8oz".into(),
-                popular: true,
-                norm: normalize("WHITE CHOCOLATE MOCHA"),
-                base: strip_size_and_temp("WHITE CHOCOLATE MOCHA"),
-                temp: None,
-            },
-            MenuItem {
-                item_id: "M4".into(),
-                name: "ICED WHITE CHOCOLATE MOCHA".into(),
-                category: "ICED COFFEE".into(),
-                price: 169.0,
-                size: "16oz".into(),
-                popular: false,
-                norm: normalize("ICED WHITE CHOCOLATE MOCHA"),
-                base: strip_size_and_temp("ICED WHITE CHOCOLATE MOCHA"),
-                temp: Some(true),
-            },
-        ];
-        // Exact match
-        let got = best_match("white chocolate mocha", &menu);
-        assert!(got.is_some());
-        assert_eq!(got.unwrap().item_id, "H5");
-
-        // Size preference
-        let got = best_match("1 iced white choco mocha 16oz", &menu);
-        assert!(got.is_some());
-        assert_eq!(got.unwrap().item_id, "M4"); // 16oz variant preferred
+    fn parsing() {
+        assert_eq!(
+            parse_items("2 iced white choco mocha + 1 banana bread"),
+            vec![(2, "iced white choco mocha".to_string()), (1, "banana bread".to_string())]
+        );
+        assert_eq!(
+            parse_items("3 pcs cookies at 1 latte 16oz"),
+            vec![(3, "cookies".to_string()), (1, "latte".to_string())]
+        );
     }
 
     #[test]
-    fn test_build_receipt() {
-        let db = Db::connect(":memory:").unwrap();
-        // Populate stub menu in DB
-        db.add_order("test", "test", "test", "test", "test", "", "").await.unwrap();
+    fn matching_and_size_preference() {
+        let menu = fake_menu();
+        assert_eq!(best_match("white chocolate mocha", &menu).unwrap().item_id, "H5");
+        assert_eq!(best_match("1 iced white choco mocha 16oz", &menu).unwrap().item_id, "M4");
+        assert!(best_match("pizza margherita", &menu).is_none());
+    }
 
-        // Test with no menu -> raw text only
-        let receipt = build_receipt(&db, "2 iced latte + 1 cookie").await.unwrap();
-        assert!(receipt.lines.contains(&"2× iced latte — (presyo titingnan ng team)".into()));
-        assert!(!receipt.has_prices);
-        assert_eq!(receipt.total, 0.0);
+    #[test]
+    fn receipts() {
+        let menu = fake_menu();
+        let r = build_receipt(&menu, "2 white choco mocha + cookies");
+        assert!(r.has_prices);
+        assert!(r.lines.contains(&"2× WHITE CHOCOLATE MOCHA (8OZ) — ₱258".to_string()), "{:?}", r.lines);
+        assert!(r.lines.contains(&"1× CHOCOLATE COOKIES — ₱85".to_string()), "{:?}", r.lines);
+        assert_eq!(r.total, 343.0);
+        assert_eq!(r.alternates.len(), 1);
 
-        // Test with menu items
-        let receipt = build_receipt(&db, "2 white choco mocha + cookies").await.unwrap();
-        assert!(receipt.has_prices);
-        assert!(receipt.lines.contains(&"2× WHITE CHOCOLATE MOCHA (8OZ) — ₱258".into()));
-        assert!(receipt.lines.contains(&"1× CHOCOLATE COOKIES — ₱85".into()));
-        assert_eq!(receipt.total, 343.0);
+        let none = build_receipt(&[], "2 iced latte");
+        assert!(!none.has_prices);
+        assert_eq!(none.lines, vec!["2 iced latte".to_string()]);
+
+        let unknown = build_receipt(&menu, "2 pizza");
+        assert!(!unknown.has_prices);
+        assert_eq!(unknown.lines, vec!["2× Pizza — (presyo titingnan ng team)".to_string()]);
     }
 }

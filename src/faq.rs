@@ -1,355 +1,258 @@
-//! FAQ content engine with live (mtime-based) reloading.
+//! Hot-reloading FAQ (faq.yaml) and knowledge base (knowledge.md).
 //!
-//! `HotFile<T>` re-reads a file whenever its mtime changes, so `faq.yaml` and
-//! `knowledge.md` stay owner-editable without a restart.
-
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+//! Accepted faq.yaml shapes (top-level list, or a map with `faqs:` / `entries:`):
+//!
+//! ```yaml
+//! - id: hours
+//!   keywords: [hours, open, "anong oras"]   # whole-word match (<=3 chars) or word-prefix match
+//!   regex: "(?i)\\bwifi\\b"                  # optional, string or list
+//!   payload: FAQ_HOURS                       # optional: quick-reply / menu payload
+//!   answer: "Bukas po kami 8AM-8PM."
+//!   quick_replies:
+//!     - { title: "Order 🛍️", payload: ORDER_START }
+//! ```
+//! An entry with `id: fallback_help` is used for unknown payloads.
 
 use regex::Regex;
-use serde_yaml::Value;
+use serde::{Deserialize, Deserializer};
+use std::path::PathBuf;
+use std::sync::RwLock;
+use std::time::{Instant, SystemTime};
+use tracing::{info, warn};
 
-#[derive(Debug)]
-pub struct QRTile {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct QuickReply {
     pub title: String,
     pub payload: String,
 }
 
-#[derive(Debug)]
-pub struct Entry {
-    pub id: String,
-    pub payloads: Vec<String>,
-    pub patterns: Vec<String>,
-    pub regexes: Vec<Regex>,
-    pub keywords: Vec<Regex>,
-    pub answer: String,
-    pub quick_replies: Vec<QRTile>,
-}
-
-#[derive(Debug, Default)]
-pub struct FaqIndex {
-    pub by_id: HashMap<String, Arc<Entry>>,
-    pub by_payload: HashMap<String, Arc<Entry>>,
-    ordered: Vec<Arc<Entry>>,
-}
-
-impl FaqIndex {
-    pub fn text_entry(&self, text: &str) -> Option<Arc<Entry>> {
-        if text.is_empty() {
-            return None;
-        }
-        let low = text.trim().to_lowercase();
-        for entry in &self.ordered {
-            if entry.patterns.iter().any(|p| low.contains(p)) {
-                return Some(entry.clone());
-            }
-            if entry.regexes.iter().any(|r| r.is_match(&low)) {
-                return Some(entry.clone());
-            }
-            if entry.keywords.iter().any(|r| r.is_match(&low)) {
-                return Some(entry.clone());
-            }
-        }
-        None
+fn string_or_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum One {
+        One(String),
+        Many(Vec<String>),
     }
-
-    pub fn payload_entry(&self, payload: &str) -> Option<Arc<Entry>> {
-        self.by_payload
-            .get(&payload.trim().to_uppercase())
-            .cloned()
-    }
-
-    pub fn entry_by_id(&self, id: &str) -> Option<Arc<Entry>> {
-        self.by_id.get(id).cloned()
-    }
-
-    pub fn all_payloads(&self) -> Vec<String> {
-        self.by_payload.keys().cloned().collect()
-    }
-}
-
-/// Caches a value parsed from a file; reloads automatically on mtime change.
-pub struct HotFile<T> {
-    path: PathBuf,
-    name: String,
-    loader: Box<dyn Fn(&Path) -> Result<T, String> + Send + Sync>,
-    state: Mutex<Option<(SystemTime, Arc<T>)>>,
-}
-
-impl<T: Send + Sync + 'static> HotFile<T> {
-    pub fn new<F>(path: impl Into<PathBuf>, name: impl Into<String>, loader: F) -> Self
-    where
-        F: Fn(&Path) -> Result<T, String> + Send + Sync + 'static,
-    {
-        Self {
-            path: path.into(),
-            name: name.into(),
-            loader: Box::new(loader),
-            state: Mutex::new(None),
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Return the cached value, reloading when the file's mtime changed.
-    ///
-    /// A missing/unreadable file keeps the last good value; if there is no
-    /// previous value the error is returned so the caller can decide.
-    pub fn get(&self) -> Result<Arc<T>, String> {
-        let mtime = fs::metadata(&self.path)
-            .and_then(|m| m.modified())
-            .map_err(|e| e.to_string());
-
-        let mut guard = self.state.lock().expect("hot file mutex poisoned");
-        match mtime {
-            Ok(mtime) => {
-                let stale = match guard.as_ref() {
-                    Some((cached_mtime, _)) => *cached_mtime != mtime,
-                    None => true,
-                };
-                if stale {
-                    match (self.loader)(&self.path) {
-                        Ok(value) => {
-                            let value = Arc::new(value);
-                            *guard = Some((mtime, value.clone()));
-                            tracing::info!(hot_file = %self.name, path = %self.path.display(), "hot file loaded");
-                            return Ok(value);
-                        }
-                        Err(err) => {
-                            tracing::error!(hot_file = %self.name, error = %err, "hot file reload failed");
-                            if let Some((_, value)) = guard.as_ref() {
-                                return Ok(value.clone());
-                            }
-                            return Err(err);
-                        }
-                    }
-                }
-                Ok(guard
-                    .as_ref()
-                    .expect("cached value missing")
-                    .1
-                    .clone())
-            }
-            Err(err) => {
-                if let Some((_, value)) = guard.as_ref() {
-                    return Ok(value.clone());
-                }
-                Err(format!("{}: {err}", self.path.display()))
-            }
-        }
-    }
-
-    /// Forget the cached mtime/value (used by tests and fresh pointers).
-    pub fn clear(&self) {
-        *self.state.lock().expect("hot file mutex poisoned") = None;
-    }
-}
-
-fn as_str_list(value: Option<&Value>) -> Vec<String> {
-    match value {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Sequence(items)) => items
-            .iter()
-            .map(|item| match item {
-                Value::String(s) => s.clone(),
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                other => format!("{other:?}"),
-            })
-            .collect(),
-        Some(other) => vec![format!("{other:?}")],
-    }
-}
-
-fn compile_keyword(keyword: &str) -> Option<Regex> {
-    let pattern = format!(r"\b{}\b", regex::escape(keyword));
-    match Regex::new(&pattern) {
-        Ok(rx) => Some(rx),
-        Err(err) => {
-            tracing::error!(keyword, error = %err, "bad keyword in faq.yaml ignored");
-            None
-        }
-    }
-}
-
-fn compile_regex(pattern: &str) -> Option<Regex> {
-    match Regex::new(&format!("(?i){pattern}")) {
-        Ok(rx) => Some(rx),
-        Err(err) => {
-            tracing::error!(pattern, error = %err, "bad regex in faq.yaml ignored");
-            None
-        }
-    }
-}
-
-fn load_entry(raw: &Value) -> Option<Entry> {
-    let map = raw.as_mapping()?;
-    let get = |key: &str| map.get(Value::String(key.to_string()));
-
-    let id = get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if id.is_empty() {
-        return None;
-    }
-
-    let quick_replies = get("quick_replies")
-        .and_then(Value::as_sequence)
-        .map(|tiles| {
-            tiles
-                .iter()
-                .filter_map(|tile| {
-                    let tile = tile.as_mapping()?;
-                    let title = tile.get(Value::String("title".into()))?.as_str()?.to_string();
-                    let payload = tile
-                        .get(Value::String("payload".into()))?
-                        .as_str()?
-                        .to_string();
-                    if title.is_empty() || payload.is_empty() {
-                        return None;
-                    }
-                    Some(QRTile {
-                        title: title.chars().take(20).collect(),
-                        payload,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let regexes = as_str_list(get("regex"))
-        .iter()
-        .filter_map(|p| compile_regex(p))
-        .collect();
-
-    let keywords = as_str_list(get("keywords"))
-        .iter()
-        .filter_map(|k| compile_keyword(&k.trim().to_lowercase()))
-        .collect();
-
-    Some(Entry {
-        id,
-        payloads: as_str_list(get("payloads"))
-            .iter()
-            .map(|p| p.trim().to_uppercase())
-            .collect(),
-        patterns: as_str_list(get("patterns"))
-            .iter()
-            .map(|p| p.to_lowercase())
-            .collect(),
-        regexes,
-        keywords,
-        answer: get("answer")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        quick_replies,
+    Ok(match One::deserialize(d)? {
+        One::One(s) => vec![s],
+        One::Many(v) => v,
     })
 }
 
-/// Parse `faq.yaml` into an ordered index. A missing file yields an empty
-/// index (so the bot still runs); a malformed file is an error so the previous
-/// good copy keeps being used.
-pub fn load_faq(path: &Path) -> Result<FaqIndex, String> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(FaqIndex::default());
-        }
-        Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
-    };
-    let raw: Value = serde_yaml::from_str(&text).map_err(|e| format!("invalid YAML: {e}"))?;
-    let entries_raw = raw
-        .as_mapping()
-        .and_then(|m| m.get(Value::String("entries".into())))
-        .and_then(Value::as_sequence)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut index = FaqIndex::default();
-    for item in &entries_raw {
-        let Some(entry) = load_entry(item) else {
-            continue;
-        };
-        let entry = Arc::new(entry);
-        if index.by_id.contains_key(&entry.id) {
-            // Preserve dict semantics: last definition wins.
-            if let Some(pos) = index.ordered.iter().position(|e| e.id == entry.id) {
-                index.ordered[pos] = entry.clone();
-            }
-        } else {
-            index.ordered.push(entry.clone());
-        }
-        index.by_id.insert(entry.id.clone(), entry.clone());
-        for payload in &entry.payloads {
-            if !payload.is_empty() {
-                index
-                    .by_payload
-                    .entry(payload.clone())
-                    .or_insert_with(|| entry.clone());
-            }
-        }
-    }
-    Ok(index)
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct FaqEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, alias = "triggers", deserialize_with = "string_or_vec")]
+    pub keywords: Vec<String>,
+    #[serde(default, alias = "regex", alias = "regexes", deserialize_with = "string_or_vec")]
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub payload: Option<String>,
+    #[serde(default, alias = "reply", alias = "response")]
+    pub answer: String,
+    #[serde(default)]
+    pub quick_replies: Vec<QuickReply>,
 }
 
-#[derive(Clone)]
+impl FaqEntry {
+    /// Quick replies as (title, payload) pairs.
+    pub fn quick_reply_pairs(&self) -> Vec<(String, String)> {
+        self.quick_replies.iter().map(|q| (q.title.clone(), q.payload.clone())).collect()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FaqFile {
+    List(Vec<FaqEntry>),
+    Map {
+        #[serde(default, alias = "faqs", alias = "faq")]
+        entries: Vec<FaqEntry>,
+    },
+}
+
+struct Compiled {
+    entry: FaqEntry,
+    keywords: Vec<String>,
+    regexes: Vec<Regex>,
+}
+
+impl Compiled {
+    fn new(entry: FaqEntry) -> Self {
+        let keywords = entry
+            .keywords
+            .iter()
+            .map(|k| k.trim().to_lowercase())
+            .filter(|k| !k.is_empty())
+            .collect();
+        let regexes = entry
+            .patterns
+            .iter()
+            .filter_map(|p| match Regex::new(p) {
+                Ok(r) => Some(r),
+                Err(err) => {
+                    warn!(id = %entry.id, error = %err, "invalid FAQ regex skipped");
+                    None
+                }
+            })
+            .collect();
+        Self { entry, keywords, regexes }
+    }
+
+    fn matches(&self, low: &str, raw: &str) -> bool {
+        self.keywords.iter().any(|k| contains_keyword(low, k))
+            || self.regexes.iter().any(|r| r.is_match(raw))
+    }
+}
+
+/// Short keywords (<= 3 chars, e.g. "hi") must match a whole word; longer ones match a word
+/// prefix so "price" also catches "prices".
+fn contains_keyword(low: &str, kw: &str) -> bool {
+    let whole = kw.chars().count() <= 3;
+    low.match_indices(kw).any(|(i, m)| {
+        let before_ok = low[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = !whole || low[i + m.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        before_ok && after_ok
+    })
+}
+
+#[derive(Default)]
+struct Inner {
+    entries: Vec<Compiled>,
+    knowledge: String,
+    faq_mtime: Option<SystemTime>,
+    knowledge_mtime: Option<SystemTime>,
+    last_check: Option<Instant>,
+}
+
 pub struct FaqStore {
-    hot: Arc<HotFile<FaqIndex>>,
+    faq_path: PathBuf,
+    knowledge_path: PathBuf,
+    inner: RwLock<Inner>,
+}
+
+fn mtime(path: &PathBuf) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 impl FaqStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            hot: Arc::new(HotFile::new(path, "faq.yaml", load_faq)),
-        }
+    pub fn new(faq_path: &str, knowledge_path: &str) -> Self {
+        let store = Self {
+            faq_path: faq_path.into(),
+            knowledge_path: knowledge_path.into(),
+            inner: RwLock::new(Inner::default()),
+        };
+        store.reload(true);
+        store
     }
 
-    pub fn get(&self) -> Arc<FaqIndex> {
-        match self.hot.get() {
-            Ok(index) => index,
-            Err(err) => {
-                tracing::error!(error = %err, "faq.yaml not found; running with no static answers");
-                Arc::new(FaqIndex::default())
+    /// Re-read files whose mtime changed (checked at most every 2 seconds).
+    fn reload(&self, force: bool) {
+        if !force {
+            let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            if guard.last_check.is_some_and(|t| t.elapsed().as_secs() < 2) {
+                return;
+            }
+        }
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        inner.last_check = Some(Instant::now());
+
+        let faq_m = mtime(&self.faq_path);
+        if force || faq_m != inner.faq_mtime {
+            inner.faq_mtime = faq_m;
+            match std::fs::read_to_string(&self.faq_path) {
+                Ok(text) => match serde_yaml::from_str::<FaqFile>(&text) {
+                    Ok(file) => {
+                        let list = match file {
+                            FaqFile::List(v) => v,
+                            FaqFile::Map { entries } => entries,
+                        };
+                        info!(count = list.len(), path = %self.faq_path.display(), "FAQ loaded");
+                        inner.entries = list.into_iter().map(Compiled::new).collect();
+                    }
+                    Err(err) => warn!(error = %err, "faq.yaml is invalid; keeping previous FAQ"),
+                },
+                Err(err) => warn!(error = %err, path = %self.faq_path.display(), "cannot read FAQ file"),
+            }
+        }
+
+        let know_m = mtime(&self.knowledge_path);
+        if force || know_m != inner.knowledge_mtime {
+            inner.knowledge_mtime = know_m;
+            if let Ok(text) = std::fs::read_to_string(&self.knowledge_path) {
+                inner.knowledge = text;
             }
         }
     }
 
-    pub fn clear_cache(&self) {
-        self.hot.clear();
+    /// First entry (file order) whose keywords/regex match the customer's text.
+    pub fn match_text(&self, text: &str) -> Option<FaqEntry> {
+        self.reload(false);
+        let low = text.to_lowercase();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.entries.iter().find(|c| c.matches(&low, text)).map(|c| c.entry.clone())
+    }
+
+    pub fn match_payload(&self, payload: &str) -> Option<FaqEntry> {
+        self.reload(false);
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner
+            .entries
+            .iter()
+            .find(|c| c.entry.payload.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(payload)))
+            .map(|c| c.entry.clone())
+    }
+
+    pub fn by_id(&self, id: &str) -> Option<FaqEntry> {
+        self.reload(false);
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.entries.iter().find(|c| c.entry.id == id).map(|c| c.entry.clone())
+    }
+
+    pub fn knowledge(&self) -> String {
+        self.reload(false);
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).knowledge.clone()
+    }
+
+    #[cfg(test)]
+    pub fn from_yaml(yaml: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("erlbrew-faq-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("faq.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        Self::new(path.to_str().unwrap(), "does-not-exist.md")
     }
 }
 
-// ---------------------------------------------------------------------------
-// knowledge.md (the LLM system prompt)
-// ---------------------------------------------------------------------------
-const MAX_PROMPT_CHARS: usize = 6000;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub fn load_prompt(path: &Path) -> Result<String, String> {
-    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let text = text.trim();
-    if text.is_empty() {
-        return Err("knowledge.md is empty".into());
+    const YAML: &str = r#"
+faqs:
+  - id: hours
+    keywords: [hours, "anong oras"]
+    answer: "Bukas po kami 8AM-8PM."
+    quick_replies:
+      - { title: "Order", payload: ORDER_START }
+  - id: greet
+    keywords: hi
+    answer: "Hello po!"
+    payload: GET_STARTED
+  - id: wifi
+    regex: '(?i)\bwi-?fi\b'
+    answer: "Password po: ask staff"
+"#;
+
+    #[test]
+    fn matching() {
+        let faq = FaqStore::from_yaml(YAML);
+        assert_eq!(faq.match_text("What are your opening HOURS?").unwrap().id, "hours");
+        assert_eq!(faq.match_text("hi po").unwrap().id, "greet");
+        assert!(faq.match_text("hindi ko alam").is_none(), "'hi' must not match 'hindi'");
+        assert_eq!(faq.match_text("may wifi ba?").unwrap().id, "wifi");
+        assert_eq!(faq.match_payload("get_started").unwrap().id, "greet");
+        assert_eq!(faq.by_id("hours").unwrap().quick_reply_pairs()[0].1, "ORDER_START");
     }
-    Ok(text.to_string())
-}
-
-pub fn system_prompt(hot: &HotFile<String>) -> String {
-    let fallback = "You are Erl, the assistant of Erlbrew Cafe in Kawit, Cavite. \
-Answer briefly and friendlily. Never guess prices, hours or availability. \
-Decline unrelated questions politely.";
-    let text = hot.get().map(|t| (*t).clone()).unwrap_or_else(|err| {
-        tracing::error!(error = %err, "knowledge.md unavailable, minimal prompt used");
-        fallback.to_string()
-    });
-    text.chars().take(MAX_PROMPT_CHARS).collect()
 }
