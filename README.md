@@ -22,6 +22,57 @@ Cloudflare Tunnel ──► this service (Rust/axum, Docker container)
         └── replies via Graph API send (24h standard messaging window)
 ```
 
+## Why the rewrite to Rust
+
+The bot started as **Python** (FastAPI + uvicorn + aiosqlite + aiomysql). It worked, but it was
+rewritten in Rust (v2.0.0) because of the environment it has to live in: a small shared server
+with tight CPU/memory limits, a public webhook that must answer immediately, and no appetite for
+a runtime that needs dependency resolution and patching on every base-image update.
+
+| | Python (before) | Rust (now) |
+|---|---|---|
+| Memory footprint | ~50 MB+ with all modules loaded | **~9.6 MB** RSS (measured, idle) |
+| Container image | `python:3.12-slim` + pip deps → **232 MB** | `debian:bookworm-slim` + binary → **142 MB** |
+| Binary / deps | `requirements.txt`, venv, interpreter in the image | one **11 MB** binary, `Cargo.lock` |
+| Container start → `/health` | ~1 s (plus interpreter warm-up) | **~3 s** including container start (measured) |
+| Idle CPU | ~0.1–1 % (event loop + GC) | **0.00 %** (measured) |
+| Errors | runtime exceptions, partially typed | compile-time types, `Result` everywhere |
+| Concurrency | asyncio, GIL-bound | tokio + axum, no GIL |
+| Tests | pytest (56 mocked tests) | `cargo test` (**44 mocked tests**) |
+
+*Python figures are from the pre-rewrite deployment; Rust figures are measured on the running
+container.*
+
+Why that matters here:
+
+- **Resource budget.** Compose caps the bot at **0.6 CPU / 256 MB** on a small shared box. The
+  Python process plus its dependency tree was the second-heaviest thing in the stack (after
+  Ollama); the Rust binary now uses a small fraction of that, which leaves headroom for the LLM
+  and the other containers on the same host.
+- **No runtime to patch.** The image is a slim Debian plus a single binary — no pip resolution at
+  build time, no virtualenv, no drift between the host and the container, and one less
+  interpreter layer to keep patched.
+- **Predictable behaviour under bursts.** The webhook answers `200` immediately and processes in
+  the background; tokio handles the burst without a thread per request and without the GIL
+  getting in the way of the SQLite/MySQL/HTTP work.
+- **Safety on the money path.** Webhook signatures are verified with a constant-time comparison,
+  the storage layer uses prepared statements behind typed APIs, and `cargo test` covers the forms,
+  dedupe, rate limiting and admin endpoints.
+- **One language, one deploy.** The same code path serves the webhook, the admin API, the health
+  check (`bot --health-check`) and the Docker image — no split between "the bot" and "the helper
+  scripts".
+
+What deliberately **did not** change, to keep the migration safe:
+
+- the webhook contract (`X-Hub-Signature-256`, same payload shape) and the admin endpoints;
+- the environment variable names (plus aliases for the old ones);
+- the SQLite schema — and an old Python database is migrated automatically on startup;
+- `faq.yaml` / `knowledge.md` (the owner's content is untouched) and the Telegram notifications.
+
+The trade-offs, for the record: compiling is slower than `pip install` (a few minutes in Docker,
+cached afterwards), Rust is more verbose than Python, and the project now needs a Rust
+toolchain — though the Docker build means nobody needs Rust installed locally to run the bot.
+
 ## What's new (since the Python rewrite)
 
 | Area | Change |
@@ -121,12 +172,13 @@ cargo build --release      # target/release/erlbrew-bot
 cargo test                 # unit + integration tests, all mocked
 ```
 
-The suite (42 tests) covers signatures, dedupe, rate limiting, FAQ matching,
+The suite (44 tests) covers signatures, dedupe, rate limiting, FAQ matching,
 handoff keywords, both form flows (invalid input + cancel), acknowledgement
 detection and rotation, the loyalty / private-events / reservation topics
 (including that they never invent details), the legacy database migration,
-pipeline order, webhook parsing, HTTP endpoints, and Telegram payloads. No
-Meta, Ollama, MySQL or Telegram traffic happens in tests.
+the human takeover (a Page-inbox reply pauses the bot, the bot's own echoes
+do not), pipeline order, webhook parsing, HTTP endpoints, and Telegram
+payloads. No Meta, Ollama, MySQL or Telegram traffic happens in tests.
 
 ## Quick start (local)
 
