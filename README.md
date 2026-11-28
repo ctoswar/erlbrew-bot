@@ -22,6 +22,16 @@ Cloudflare Tunnel ──► this service (Rust/axum, Docker container)
         └── replies via Graph API send (24h standard messaging window)
 ```
 
+## What's new (since the Python rewrite)
+
+| Area | Change |
+|---|---|
+| Runtime | The Python bot is gone — one Rust binary (`erlbrew-bot`) in a `debian:bookworm-slim` image. `Dockerfile` is the canonical build; the compose healthcheck calls `/usr/local/bin/bot --health-check`. |
+| Database | A database created by the old Python bot is migrated automatically on startup (renamed columns + copy of `event_forms` / `event_leads`), so an existing `data/erlbrew.db` keeps working. |
+| LLM | `OLLAMA_THINK=false` and the other Ollama tuning variables are now honoured, the model is warmed at startup and kept resident: warm answers take ~1 s instead of timing out with `ollama request failed`. |
+| Chat | Acknowledgements and closings ("thank you", "ok", "sige", 👍) get one warm closing line instead of the cold LLM fallback. |
+| Topics | Loyalty, private events and table reservations have scripted answers that never invent stamps, points, rewards, prices, packages, capacity or availability. |
+
 ## Feature checklist
 
 - Meta webhook verification + **X-Hub-Signature-256** (HMAC-SHA256, constant-time
@@ -93,7 +103,7 @@ Cloudflare Tunnel ──► this service (Rust/axum, Docker container)
 | `src/events.rs` | event booking state machine |
 | `src/orders.rs` | order intake state machine |
 | `src/menu.rs` | live POS menu reader (read-only MySQL, TTL cache, fuzzy matcher) |
-| `src/pipeline.rs` | message pipeline (dedupe → rate limit → forms → FAQ → LLM) |
+| `src/pipeline.rs` | message pipeline (dedupe → rate limit → acks → forms → topics → FAQ → LLM) |
 | `src/routes.rs` | axum routes (`/webhook`, `/health`, `/admin/*`, `/privacy`) |
 | `src/llm.rs` | the single Ollama `generate()` call |
 | `src/notify.rs` | Telegram notifications |
@@ -111,10 +121,12 @@ cargo build --release      # target/release/erlbrew-bot
 cargo test                 # unit + integration tests, all mocked
 ```
 
-The tests cover signatures, dedupe, rate limiting, FAQ matching, handoff
-keywords, both form flows (invalid input + cancel), pipeline order, webhook
-parsing, HTTP endpoints, and Telegram payloads. No Meta, Ollama, MySQL or
-Telegram traffic happens in tests.
+The suite (42 tests) covers signatures, dedupe, rate limiting, FAQ matching,
+handoff keywords, both form flows (invalid input + cancel), acknowledgement
+detection and rotation, the loyalty / private-events / reservation topics
+(including that they never invent details), the legacy database migration,
+pipeline order, webhook parsing, HTTP endpoints, and Telegram payloads. No
+Meta, Ollama, MySQL or Telegram traffic happens in tests.
 
 ## Quick start (local)
 
@@ -289,6 +301,16 @@ compose file publishes port 8085; point the tunnel at the bot container.
   an error (last good copy keeps being used).
 - Event/order form wording and canned texts live in `src/events.rs`,
   `src/orders.rs` and `src/config.rs` and need a rebuild.
+
+## Owner to-do (placeholders)
+
+1. **`faq.yaml`** — replace every `[PLACEHOLDER: …]` block (welcome text, payments, hours,
+   …). The `events` entry is already scripted: do **not** add prices, packages, capacity or
+   availability to it — the team sends those after the booking form.
+2. **`src/topics.rs` → `LOYALTY_POLICY`** — add 1–2 sentences on how stamps/points are earned
+   and what the reward is, e.g. *"Every ₱__ purchase = 1 stamp, __ stamps = free drink"*.
+   Until then the bot only points to the loyalty app and never invents the policy.
+3. **`knowledge.md`** — keep the LLM system prompt under ~400 words.
 
 ## Ops cheat-sheet
 
