@@ -136,6 +136,11 @@ files) is writable by the host user. Resource limits are `cpus: 0.60` /
 `data/` is bind-mounted so `faq.yaml`, `knowledge.md`, `privacy.html` and the
 SQLite DB survive rebuilds and are editable live.
 
+An existing SQLite database created by the old Python bot is migrated
+automatically on startup: renamed columns (`seen_at`, `last_sent`,
+`created_at`) are fixed in place, and legacy `event_forms` / `event_leads`
+rows are copied into `forms` / `leads`.
+
 > `OLLAMA_BASE_URL` defaults to `http://host.docker.internal:11434`, and
 > compose adds `extra_hosts: host.docker.internal:host-gateway` so a container
 > can reach an Ollama running on the Docker host itself.
@@ -272,7 +277,7 @@ curl -X POST https://bot.example.com/admin/unpause/PSID_123 \
 curl https://bot.example.com/health
 
 # leads so far (they are also Telegram-alerted):
-sqlite3 data/erlbrew.db 'SELECT * FROM event_leads;'
+sqlite3 data/erlbrew.db 'SELECT * FROM leads;'
 
 # newest orders (token-protected):
 curl https://bot.example.com/admin/orders?limit=10 \

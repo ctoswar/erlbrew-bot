@@ -83,6 +83,72 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 ";
 
+// ---------------------------------------------------------------------------
+// Legacy (Python bot) schema migration
+// ---------------------------------------------------------------------------
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn rename_column(conn: &Connection, table: &str, old: &str, new: &str) -> Result<()> {
+    if column_exists(conn, table, old)? && !column_exists(conn, table, new)? {
+        conn.execute_batch(&format!("ALTER TABLE {table} RENAME COLUMN {old} TO {new}"))?;
+    }
+    Ok(())
+}
+
+fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    if !column_exists(conn, table, column)? {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
+/// Bring a database created by the old Python bot up to the Rust schema.
+///
+/// The table names mostly match, but a few columns were renamed. Legacy
+/// `event_forms` / `event_leads` rows are copied into `forms` / `leads` so an
+/// in-flight booking or saved lead is not lost during the upgrade.
+fn migrate(conn: &Connection) -> Result<()> {
+    rename_column(conn, "seen_messages", "created_at", "seen_at")?;
+    rename_column(conn, "notices", "ts", "last_sent")?;
+    rename_column(conn, "orders", "ts", "created_at")?;
+    add_column(conn, "orders", "total_estimate", "TEXT NOT NULL DEFAULT ''")?;
+
+    if table_exists(conn, "event_forms")? {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO forms (psid, step, data, tries, updated_at)
+             SELECT psid, step, data, tries, updated_at FROM event_forms",
+        )?;
+    }
+    if table_exists(conn, "event_leads")? {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO leads (id, psid, event_type, event_when, guests, name, contact, created_at)
+             SELECT id, psid, event_type, event_when, guests, name, contact, created_at FROM event_leads",
+        )?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn connect(path: &str) -> Result<Self> {
         if path != ":memory:" {
@@ -98,6 +164,7 @@ impl Db {
         // journal_mode returns a row, so go through query_row (ignored for :memory:).
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         conn.execute_batch(SCHEMA).context("creating schema")?;
+        migrate(&conn).context("migrating legacy schema")?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -329,6 +396,66 @@ mod tests {
 
     fn db() -> Db {
         Db::connect(":memory:").unwrap()
+    }
+
+    #[test]
+    fn legacy_python_schema_is_migrated() {
+        let path = std::env::temp_dir().join(format!(
+            "erlbrew-legacy-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE seen_messages (mid TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
+                 CREATE TABLE notices (psid TEXT NOT NULL, kind TEXT NOT NULL, ts INTEGER NOT NULL,
+                                       PRIMARY KEY (psid, kind));
+                 CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                                      psid TEXT NOT NULL, items TEXT NOT NULL, name TEXT NOT NULL,
+                                      address TEXT NOT NULL, contact TEXT NOT NULL,
+                                      status TEXT NOT NULL DEFAULT 'new',
+                                      menu_note TEXT NOT NULL DEFAULT '',
+                                      total_estimate TEXT NOT NULL DEFAULT '');
+                 CREATE TABLE event_forms (psid TEXT PRIMARY KEY, step TEXT NOT NULL,
+                                           data TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0,
+                                           updated_at INTEGER NOT NULL);
+                 CREATE TABLE event_leads (id INTEGER PRIMARY KEY AUTOINCREMENT, psid TEXT NOT NULL,
+                                           event_type TEXT NOT NULL, event_when TEXT NOT NULL,
+                                           guests INTEGER NOT NULL, name TEXT NOT NULL,
+                                           contact TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new',
+                                           created_at INTEGER NOT NULL);
+                 INSERT INTO seen_messages VALUES ('m1', 1);
+                 INSERT INTO notices VALUES ('u', 'rate', 1);
+                 INSERT INTO orders (ts, psid, items, name, address, contact)
+                     VALUES (1, 'u', 'latte', 'Ana', 'Kawit', '09171234567');
+                 INSERT INTO event_forms VALUES ('f1', 'event_type', '{}', 0, 1);
+                 INSERT INTO event_leads (psid, event_type, event_when, guests, name, contact, created_at)
+                     VALUES ('u', 'birthday', 'May 12', 5, 'Ana', '09171234567', 1);",
+            )
+            .unwrap();
+        }
+
+        let db = Db::connect(path.to_str().unwrap()).unwrap();
+
+        // Renamed columns: dedupe, one-off notices and order timestamps all work.
+        assert!(db.mark_message_seen("m2").unwrap());
+        assert!(db.pop_notice_once("u", "rate", 600).unwrap());
+        assert!(!db.pop_notice_once("u", "rate", 600).unwrap());
+        db.add_order("u", "2 latte", "Ana", "Kawit", "09171234567", "258").unwrap();
+        assert_eq!(db.list_orders(10).unwrap().len(), 2);
+        assert!(db.add_lead("u", "birthday", "May 12", 10, "Ana", "09171234567").unwrap() > 0);
+
+        // Legacy rows were copied into the Rust table names.
+        assert_eq!(db.get_form("f1").unwrap().unwrap().step, "event_type");
+        let leads: i64 =
+            db.lock().query_row("SELECT COUNT(*) FROM leads", [], |r| r.get(0)).unwrap();
+        assert_eq!(leads, 2);
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]
