@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS seen_messages (
     mid TEXT PRIMARY KEY,
     seen_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bot_messages (
+    mid TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rate_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     psid TEXT NOT NULL,
@@ -242,6 +246,27 @@ impl Db {
         Ok(n == 1)
     }
 
+    /// Remember a message id the bot itself sent, so its own echo can be recognised.
+    pub fn mark_bot_message(&self, mid: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT OR IGNORE INTO bot_messages (mid, created_at) VALUES (?1, ?2)",
+            params![mid, now()],
+        )?;
+        Ok(())
+    }
+
+    /// True when `mid` belongs to a message the bot sent (not a human reply).
+    pub fn is_bot_message(&self, mid: &str) -> Result<bool> {
+        if mid.is_empty() {
+            return Ok(false);
+        }
+        let found: Option<i64> = self
+            .lock()
+            .query_row("SELECT 1 FROM bot_messages WHERE mid = ?1", [mid], |r| r.get(0))
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     pub fn note_rate_event(&self, psid: &str) -> Result<()> {
         self.lock()
             .execute("INSERT INTO rate_events (psid, ts) VALUES (?1, ?2)", params![psid, now()])?;
@@ -284,6 +309,7 @@ impl Db {
         let t = now();
         let conn = self.lock();
         conn.execute("DELETE FROM seen_messages WHERE seen_at < ?1", [t - 7 * 86_400])?;
+        conn.execute("DELETE FROM bot_messages WHERE created_at < ?1", [t - 7 * 86_400])?;
         conn.execute("DELETE FROM rate_events WHERE ts < ?1", [t - 86_400])?;
         conn.execute("DELETE FROM forms WHERE updated_at < ?1", [t - 7 * 86_400])?;
         Ok(())
@@ -456,6 +482,16 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn bot_messages_are_recognised() {
+        let db = db();
+        assert!(!db.is_bot_message("").unwrap());
+        assert!(!db.is_bot_message("mid.1").unwrap());
+        db.mark_bot_message("mid.1").unwrap();
+        assert!(db.is_bot_message("mid.1").unwrap());
+        assert!(!db.is_bot_message("mid.2").unwrap());
     }
 
     #[test]

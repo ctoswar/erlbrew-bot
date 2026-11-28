@@ -33,12 +33,21 @@ impl App {
     }
 
     /// Send a reply; delivery problems are logged but never abort the pipeline.
+    /// The ids of the sent messages are recorded so the bot recognises its own echoes and
+    /// never pauses itself when a team member joins the chat.
     pub async fn send(&self, psid: &str, reply: &Reply) {
         if reply.text.is_empty() {
             return;
         }
-        if let Err(err) = self.messenger.send_reply(psid, reply).await {
-            error!(error = %err, "failed to send reply");
+        match self.messenger.send_reply(psid, reply).await {
+            Ok(mids) => {
+                for mid in mids {
+                    if let Err(err) = self.db.mark_bot_message(&mid) {
+                        error!(error = %err, "could not record own message id");
+                    }
+                }
+            }
+            Err(err) => error!(error = %err, "failed to send reply"),
         }
     }
 }

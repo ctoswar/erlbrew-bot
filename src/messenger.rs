@@ -94,14 +94,20 @@ impl Messenger {
         Ok(body)
     }
 
-    pub async fn send_reply(&self, psid: &str, reply: &Reply) -> Result<()> {
+    /// Send a reply and return the message ids the Graph API assigned to it, so the caller can
+    /// recognise the bot's own echoes later.
+    pub async fn send_reply(&self, psid: &str, reply: &Reply) -> Result<Vec<String>> {
         let chunks = chunk_text(&reply.text, MAX_TEXT);
         let last = chunks.len().saturating_sub(1);
+        let mut mids = Vec::new();
         for (i, chunk) in chunks.iter().enumerate() {
             let qrs: &[(String, String)] = if i == last { &reply.quick_replies } else { &[] };
-            self.post_graph("me/messages", &message_body(psid, chunk, qrs)).await?;
+            let body = self.post_graph("me/messages", &message_body(psid, chunk, qrs)).await?;
+            if let Some(mid) = body.get("message_id").and_then(Value::as_str) {
+                mids.push(mid.to_string());
+            }
         }
-        Ok(())
+        Ok(mids)
     }
 
     async fn sender_action(&self, psid: &str, action: &str) {
