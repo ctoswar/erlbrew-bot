@@ -169,13 +169,18 @@ docker exec ollama ollama pull qwen3.5:2b   # once; ~2.7 GB stored in the ollama
 The bot calls `POST {OLLAMA_URL}/api/chat` with:
 
 ```json
-{"model": "qwen3.5:2b", "stream": false,
+{"model": "qwen3.5:2b", "stream": false, "think": false, "keep_alive": "24h",
  "messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}],
- "options": {"temperature": 0.3, "num_predict": 300}}
+ "options": {"temperature": 0.2, "num_predict": 120, "num_ctx": 2048}}
 ```
 
-- Requests time out after `LLM_TIMEOUT_SEC` (25 s) and fall back to the static
-  Taglish message + Telegram alert.
+- `think: false` is important on thinking-capable models: it skips the long
+  reasoning pass and keeps warm answers around 1 s instead of 60 s+.
+- The model is loaded once at startup (warm-up) and kept resident with
+  `OLLAMA_KEEP_ALIVE` so the first customer does not pay the cold start.
+- Requests time out after `LLM_TIMEOUT_SEC` (90 s) and fall back to the static
+  Taglish message + Telegram alert. The startup warm-up has its own 5-minute
+  timeout so a slow cold load cannot abort it.
 - The system prompt lives in `knowledge.md` (**≤ ~400 words**; keep INFO to
   facts you actually want the bot to say — never real-time stock or prices
   you don't want printed).
@@ -240,7 +245,8 @@ compose file publishes port 8085; point the tunnel at the bot container.
 | `GRAPH_API_VERSION` | default `v21.0` (`GRAPH_VERSION` also accepted) |
 | `ADMIN_TOKEN` | `X-Admin-Token` for `POST /admin/unpause/{psid}` |
 | `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | e.g. `http://host.docker.internal:11434`, `qwen3.5:2b` (`OLLAMA_URL` also accepted) |
-| `LLM_TIMEOUT_SEC` | hard fallback timeout (25) |
+| `OLLAMA_THINK` / `OLLAMA_NUM_PREDICT` / `OLLAMA_NUM_CTX` / `OLLAMA_TEMPERATURE` / `OLLAMA_KEEP_ALIVE` | Ollama tuning: `false / 120 / 2048 / 0.2 / 24h` |
+| `LLM_TIMEOUT_SEC` | hard fallback timeout (90) |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | notifications |
 | `EVENT_REPLY_HOURS` | promised team-reply time on completed bookings (24) |
 | `DB_PATH` | SQLite `data/erlbrew.db` |

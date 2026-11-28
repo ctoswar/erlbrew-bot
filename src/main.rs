@@ -58,6 +58,12 @@ fn build_app(settings: Settings) -> Result<state::App> {
     };
     let menu = Arc::new(menu::MenuCache::new(settings.clone()));
 
+    // Load the Ollama model in the background so the first customer does not wait for it.
+    if let Some(llm) = &llm {
+        let llm = llm.clone();
+        tokio::spawn(async move { llm.warm_up().await });
+    }
+
     Ok(state::App { settings, db, faq, messenger, notifier, menu, llm, started: Instant::now() })
 }
 

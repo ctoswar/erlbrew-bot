@@ -73,6 +73,11 @@ pub struct Settings {
 
     pub ollama_url: String,
     pub ollama_model: String,
+    pub ollama_think: bool,
+    pub ollama_num_predict: i64,
+    pub ollama_num_ctx: i64,
+    pub ollama_temperature: f64,
+    pub ollama_keep_alive: String,
     pub llm_timeout_sec: u64,
 
     pub telegram_bot_token: String,
@@ -136,7 +141,12 @@ impl Settings {
 
             ollama_url: env_str_any(&["OLLAMA_URL", "OLLAMA_BASE_URL"], "http://127.0.0.1:11434"),
             ollama_model: env_str("OLLAMA_MODEL", "qwen2.5:3b"),
-            llm_timeout_sec: env_parse("LLM_TIMEOUT_SEC", 25),
+            ollama_think: env_parse("OLLAMA_THINK", false),
+            ollama_num_predict: env_parse("OLLAMA_NUM_PREDICT", 120),
+            ollama_num_ctx: env_parse("OLLAMA_NUM_CTX", 2048),
+            ollama_temperature: env_parse("OLLAMA_TEMPERATURE", 0.2),
+            ollama_keep_alive: env_str("OLLAMA_KEEP_ALIVE", "24h"),
+            llm_timeout_sec: env_parse("LLM_TIMEOUT_SEC", 90),
 
             telegram_bot_token: env_str("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id: env_str("TELEGRAM_CHAT_ID", ""),
