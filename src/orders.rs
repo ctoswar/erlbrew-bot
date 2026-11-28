@@ -1,447 +1,319 @@
 //! Order intake form — a deterministic state machine (NOT LLM-driven).
 //!
-//! Steps: order_items -> order_name -> order_address -> order_contact -> done.
-//! State lives in the same SQLite form slot as the event form (per PSID) — the
-//! pipeline dispatches to this module whenever the active step starts with
-//! "order_". The customer may type "cancel" (or similar) at any time.
+//! Steps: order_items -> order_confirm -> order_name -> order_address -> order_contact -> done.
+//! State lives in the same SQLite form slot as the event form (per PSID); the pipeline
+//! dispatches here whenever the active step starts with "order_". The customer may type
+//! "cancel" (or similar) at any time.
 //!
-//! The completed order is saved to the `orders` table and the team is notified
-//! via Telegram. After the items step the bot shows a priced RECEIPT built from
-//! the live POS menu (menu.py): real prices, real variant sizes; the displayed
-//! total is an ESTIMATE — the team still confirms the final total in chat.
-//! Payment methods and delivery schedules are NEVER confirmed by the bot.
+//! After the items step the bot shows a priced RECEIPT built from the live POS menu: real
+//! prices, real variant sizes. The total is an ESTIMATE — the team still confirms the final
+//! total in chat. Payment methods and delivery schedules are NEVER confirmed by the bot.
+//! The completed order is saved to the `orders` table and the team is notified via Telegram.
 
-use crate::config::Settings;
-use crate::db::Db;
-use crate::events::Q_FORM_DONE;
-use crate::menu;
-use crate::messenger::Messenger;
-use crate::notify;
-use anyhow::{bail, Result};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use crate::db::FormRow;
+use crate::forms::{
+    clean_len, clean_name, clean_ph_mobile, fill, is_cancel, kind_of_step, plain, qr, FormKind, Reply,
+    MAX_TRIES,
+};
+use crate::menu::fmt_price;
+use crate::state::App;
+use std::collections::HashMap;
+use tracing::{error, info};
 
-#[derive(Clone, Debug, Default)]
-pub struct Reply {
-    pub text: String,
-    pub quick_replies: Vec<(String, String)>,
+pub const PAYLOAD_OK: &str = "ORD_OK";
+pub const PAYLOAD_EDIT: &str = "ORD_EDIT";
+
+#[derive(Debug, PartialEq, Eq)]
+enum Confirm {
+    Ok,
+    Edit,
+    Unknown,
 }
 
-#[derive(Clone, Debug)]
-pub struct _State {
-    pub step: String,
-    pub data: HashMap<String, String>,
-    pub tries: i64,
-}
-
-const CANCEL_SET: &[&str] = &[
-    "cancel", "cancelled", "canceled", "cancel po", "cancel nl", "cancel it",
-    "cancel order", "ayoko na", "nevermind", "never mind", "wag na",
-    "wag nalang", "not now", "next time",
+const OK_WORDS: &[&str] = &[
+    "ord ok", "tama", "tama po", "tama na", "oo", "oo po", "opo", "yes", "yes po", "sige",
+    "sige po", "ok", "ok po", "okay", "okay po", "correct", "ayos", "ayos lang", "ayos lang po",
+    "go", "sure",
+];
+const EDIT_WORDS: &[&str] = &[
+    "ord edit", "edit", "mali", "mali po", "palit", "palit po", "papalitan", "papalitan po",
+    "papalatan", "papalatan po", "may papalit", "hindi", "hindi po", "no", "wrong", "change",
 ];
 
-/// Map of yes/edit confirm answers
-#[derive(Clone, Debug)]
-pub struct ConfirmMap(HashMap<String, String>);
-
-impl ConfirmMap {
-    pub fn new() -> Self {
-        let mut map = HashMap::new();
-        map.insert("tama".into(), "ok".into());
-        map.insert("tama po".into(), "ok".into());
-        map.insert("tama na".into(), "ok".into());
-        map.insert("oo".into(), "ok".into());
-        map.insert("oo po".into(), "ok".into());
-        map.insert("opo".into(), "ok".into());
-        map.insert("yes".into(), "ok".into());
-        map.insert("yes po".into(), "ok".into());
-        map.insert("sige".into(), "ok".into());
-        map.insert("sige po".into(), "ok".into());
-        map.insert("ok".into(), "ok".into());
-        map.insert("ok po".into(), "ok".into());
-        map.insert("okay".into(), "ok".into());
-        map.insert("okay po".into(), "ok".into());
-        map.insert("correct".into(), "ok".into());
-        map.insert("ayos".into(), "ok".into());
-        map.insert("ayos lang".into(), "ok".into());
-        map.insert("ayos lang po".into(), "ok".into());
-        map.insert("go".into(), "ok".into());
-        map.insert("sure".into(), "ok".into());
-        ConfirmMap(map)
-    }
-
-    pub fn lookup(&self, value: &str) -> Option<&str> {
-        self.0.get(value).map(|s| s.as_str())
-    }
-}
-
-/// Pre-built instance so bot code stays the same as Python.
-pub static CONFIRM_MAP: ConfirmMap = ConfirmMap::new();
-
-/// ---------------------------------------------------------------------
-//  Public API
-//  ---------------------------------------------------------------------
-
-/// Return true if the customer currently has an active order form.
-pub async fn has_active_form(db: &Db, psid: &str) -> bool {
-    db.get_form(psid)
-        .await
-        .map(|row| row.is_some())
-        .unwrap_or(false)
-}
-
-/// Re-ask the current step's question (e.g. for images / stickers).
-pub async fn current_question(db: &Db, psid: &str) -> Option<Reply> {
-    db.get_form(psid).await.ok().map(|row| Reply {
-        text: format!("{}?", row.step),
-        quick_replies: vec![],
-    })
-}
-
-/// Start the form from scratch. Sets step = "order_items".
-pub async fn start_form(db: &Db, psid: &str) -> Reply {
-    db.set_form(psid, "order_items", &HashMap::new(), 0)
-        .await
-        .ok();
-    Reply::new(Q_ORDER_ITEMS.clone(), vec![])
-}
-
-/// Advance the form with one input. Returns None when there is no form.
-pub async fn handle_input(
-    messenger: &Arc<Messenger>,
-    db: &Db,
-    menu_mod: &menu::Menu,
-    psid: &str,
-    raw_value: &str,
-) -> Option<Reply> {
-    let row = db.get_form(psid).await.ok()?;
-    let (step, data, tries) = (row.step.clone(), row.data.clone(), row.tries);
-
-    // Cancel?
-    if is_cancel(raw_value) {
-        db.delete_form(psid).await.ok()?;
-        return Some(Reply::new(Q_FORM_CANCELLED.clone(), vec![]));
-    }
-
-    // Interpret: what did the customer say?
-    let low = raw_value.to_lowercase().trim().to_string();
-
-    // Confirm step?
-    if step == "order_confirm" {
-        return handle_confirm(messenger, db, menu_mod, psid, &low).await;
-    }
-
-    // Normal steps validation
-    let parsed = match step.as_str() {
-        "order_items" => _val_items(&low),
-        "order_name" => _val_name(&low),
-        "order_address" => _val_address(&low),
-        "order_contact" => _val_contact(&low),
-        _ => None,
-    };
-
-    let Some(parsed) = parsed else {
-        // re-ask
-        let new_tries = if tries >= 3 { 0 } else { tries + 1 };
-        db.set_form(psid, &step, &data, new_tries).await.ok()?;
-        let hint = _HINTS.get(step).map(|h| h.clone()).unwrap_or_default();
-        return Some(Reply::new(format!("{}{}REASK_PREFIX", Q_REASK_PREFIX, hint), vec![]));
-    };
-
-    // Store the parsed value
-    let key = step.strip_prefix("order_").unwrap_or(step);
-    let mut new_data = data.clone();
-    new_data.insert(key.into(), parsed.clone());
-
-    // If we just finished items, ask for confirmation (with receipt)
-    if step == "order_items" {
-        return await ask_confirm(messenger, db, menu_mod, psid, &new_data).await;
-    }
-
-    // Otherwise advance to next step
-    let nxt = match step.as_str() {
-        "order_name" => "order_address",
-        "order_address" => "order_contact",
-        _ => "order_items",
-    };
-    db.set_form(psid, &nxt, &new_data, 0)
-        .await
-        .ok();
-    Some(_question_for_order(&nxt))
-}
-
-/// Check if input is a cancel command
-fn is_cancel(value: &str) -> bool {
-    let s = value.trim().to_lowercase();
-    CANCEL_SET.iter().any(|&kw| s == kw || s.starts_with(kw) && s.len() > kw.len())
-}
-
-/// Ask the customer to confirm the receipt (with live prices).
-async fn ask_confirm(
-    messenger: &Arc<Messenger>,
-    db: &Db,
-    menu_mod: &menu::Menu,
-    psid: &str,
-    data: &HashMap<String, String>,
-) -> Option<Reply> {
-    let raw_items = data.get("items")?.clone().unwrap_or_default();
-    let receipt = menu_mod.build_receipt(&raw_items).await;
-    let mut new_data = data.clone();
-    new_data.insert("menu_note".into(), receipt.lines.join("\n"));
-    if receipt.has_prices {
-        new_data.insert(
-            "total_estimate".into(),
-            menu::_fmt_price(receipt.total),
-        );
+fn confirm_intent(raw: &str) -> Confirm {
+    let p = plain(raw);
+    if OK_WORDS.contains(&p.as_str()) {
+        Confirm::Ok
+    } else if EDIT_WORDS.contains(&p.as_str()) {
+        Confirm::Edit
     } else {
-        new_data.remove("total_estimate");
-    }
-    db.set_form(psid, "order_confirm", &new_data, 0)
-        .await
-        .ok();
-
-    let lines: String = receipt
-        .lines
-        .iter()
-        .map(|l| format!("• {l}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let alt = if !receipt.alternates.is_empty() {
-        format!("\n{}", receipt.alternates.join("\n"))
-    } else {
-        String::new()
-    };
-    let total = if !receipt.has_prices {
-        Q_TOTAL_NO_PRICES.into()
-    } else {
-        Q_TOTAL_ESTIMATE.format(total = menu::_fmt_price(receipt.total))
-    };
-
-    let text = Q_ORDER_CONFIRM.format(
-        lines = if lines.is_empty() { "" } else { &lines },
-        alternates = &alt,
-        total = &total,
-    );
-
-    let quick = if receipt.has_prices {
-        vec![
-            ("Tama po ✅", "ORD_OK"),
-            ("Papalatan ✏️", "ORD_EDIT"),
-        ]
-    } else {
-        vec![]
-    };
-
-    Some(Reply {
-        text,
-        quick_replies: quick,
-    })
-}
-
-/// Handle the confirm step: accept / edit / neither
-async fn handle_confirm(
-    messenger: &Arc<Messenger>,
-    db: &Db,
-    menu_mod: &menu::Menu,
-    psid: &str,
-    low: &str,
-) -> Option<Reply> {
-    let row = db.get_form(psid).await.ok()?;
-    let (step, data, tries) = (row.step.clone(), row.data.clone(), row.tries);
-
-    // Look up confirm intent
-    let verdict = CONFIRM_MAP.lookup(low)?;
-
-    match verdict {
-        "ok" => {
-            // Continue the intake (name/address/mobile); menu_note and
-            // total_estimate were stored during _ask_confirm.
-            db.set_form(psid, "order_name", &data, 0)
-                .await
-                .ok();
-            Some(_question_for_order("order_name"))
-        }
-        "edit" => {
-            // Restart the items step (keep nothing else cleared)
-            let mut new_data = data.clone();
-            new_data.remove("menu_note");
-            new_data.remove("total_estimate");
-            db.set_form(psid, "order_items", &new_data, 0)
-                .await
-                .ok();
-            log::info!("order receipt: customer edits items");
-            Some(_question_for_order("order_items"))
-        }
-        _ => {
-            // Neither: count toward give-up
-            let new_tries = if tries >= 3 { 0 } else { tries + 1 };
-            db.set_form(psid, &step, &data, new_tries).await.ok()?;
-            Some(Reply::new(format!("{}{}REASK_PREFIX", Q_REASK_PREFIX, Q_ORDER_CONFIRM_HINT), vec![]))
-        }
+        Confirm::Unknown
     }
 }
-
-/// Validators
-
-fn _val_items(value: &str) -> Option<String> {
-    let v = value.trim();
-    if 2 <= v.len() && v.len() <= 500 {
-        return Some(v.into());
-    }
-    None
-}
-
-fn _val_name(value: &str) -> Option<String> {
-    let v = value.trim();
-    if 2 <= v.len() && v.len() <= 120 {
-        return Some(v.into());
-    }
-    None
-}
-
-fn _val_address(value: &str) -> Option<String> {
-    let v = value.trim();
-    if 5 <= v.len() && v.len() <= 300 {
-        return Some(v.into());
-    }
-    None
-}
-
-fn _val_contact(value: &str) -> Option<String> {
-    let digits = regex::Regex::new(r"[\s\-().]")
-        .ok()?
-        .replace_all(value, "");
-    let digits = digits.lstrip("+");
-    if regex::Regex::new(r"(?:0|63)?9\d{9}")
-        .ok()?
-        .is_match(&digits)
-    {
-        return Some(digits);
-    }
-    None
-}
-
-/// Question text mapping
-fn _question_for_order(step: &str) -> Reply {
-    match step {
-        "order_items" => Reply::new(Q_ORDER_ITEMS.clone(), vec![]),
-        "order_name" => Reply::new(Q_ORDER_NAME.clone(), vec![]),
-        "order_address" => Reply::new(Q_ORDER_ADDRESS.clone(), vec![]),
-        "order_contact" => Reply::new(Q_ORDER_CONTACT.clone(), vec![]),
-        "order_confirm" => Reply::new(Q_ORDER_CONFIRM.format(
-            lines = "",
-            alternates = "",
-            total = Q_TOTAL_NO_PRICES.into(),
-        ), vec![]),
-        _ => Reply::new(Q_FORM_CANCELLED.into(), vec![]),
-    }
-}
-
-// Global question texts
-static Q_ORDER_ITEMS: &str = "Sige po! Order tayo 🛍️ Anong items po natin?\n\
-(e.g. 'iced white choco mocha + 2 cookies' — isulat na lang po ang buong \
-order nyo.)\n\
-Paalala po: FREE po ang delivery sa Masaito at Lancaster residence; sa \
-labas po natin isine-send via Lalamove. 😊";
-
-static Q_ORDER_ITEMS_HINT: &str = "Isulat po ang buong order ninyo, e.g. '2 pcs Iced Latte + 1 Blueberry \
-Cheesecake'. ('cancel' kung gusto nyo po tumigil)";
-
-static Q_ORDER_NAME: &str = "Anong pangalan po natin for the order?";
-
-static Q_ORDER_NAME_HINT: &str = "Paki-type lang po ang pangalan (o pangalan ng nag-order), e.g. 'Maria Santos'. 😊";
-
-static Q_ORDER_ADDRESS: &str = "Anong full address po (house/unit + street + subdivision/barangay)?\n\
-🆓 FREE po natin: Masaito at Lancaster residence.";
-
-static Q_ORDER_ADDRESS_HINT: &str = "Paki-type po ang buong delivery address po, e.g. 'Blk 2 Lot 3, \
-Masaito Residence, Kawit'. ('cancel' kung gusto nyo po tumigil)";
-
-static Q_ORDER_CONTACT: &str = "Anong mobile number po? (para po sa delivery updates, e.g. 0917-123-4567 \
-o +639171234567)";
-
-static Q_ORDER_CONTACT_HINT: &str = "Pasensya po — number po ba? Pakitype po ng PH mobile number, e.g. \
-09171234567. ('cancel' kung ayaw nyo na po)";
-
-static Q_ORDER_CONFIRM: &str = "Ito po ang order natin 🧾\n\
-{lines}\n\
-{alternates}\n\
-{total}\n\
-Tama po ba ito, o may papalit?";
-
-static Q_ORDER_CONFIRM_HINT: &str = "Tama po ba ang order ninyo? Reply po ng 'tama' \
-po ba o 'mali/palit' kung may papalit. ('cancel' para tumigil)";
-
-static Q_TOTAL_ESTIMATE: &str = "Estimated total: ₱{total} (kakumpirmahin po ng team ang exact total)";
-
-static Q_TOTAL_NO_PRICES: &str = "(Presyo po — kakumpirmahin ng team ang exact total)";
-
-static Q_FORM_DONE: &str = "Salamat po, {name}! 🎉 Na-record na po ang order ninyo #{oid}:\n\
-• Items: {items}\n\
-{total_line}\n\
-• Address: {address}\n\
-• Mobile: {contact}\n\
-• Delivery: FREE po ito sa Masaito/Lancaster residence — sa labas po, \
-Lalamove natin at sasabihin ng team ang exact fee. 😊\n\n\
-Ang aming team po ang magco-confirm DITO sa chat ng total, payment \
-(cash/GCash) at delivery schedule. Sandali lang po sila. ☕";
-
-static Q_FORM_CANCELLED: &str = "Sige po — kinansel ko po muna ang order form 😊 \
-I-type lang po ang 'order' ulit kapag ready na kayo, o mag-message dito \
-para makita ng team natin ang message nyo po.";
-
-static Q_FORM_GAVE_UP: &str = "Hindi ko na po maituloy ang order form, kinansel ko po muna ito 😅 \
-— i-type po ang 'order' ulit kahit kailan, o tap 'Order' button kapag ready.";
-
-static Q_REASK_PREFIX: &str = "Pasensya po — ";
-
-// -HINTS
-static _HINTS: &[(&str, &str)] = &[
-    ("order_items", &Q_ORDER_ITEMS_HINT),
-    ("order_confirm", &Q_ORDER_CONFIRM_HINT),
-    ("order_name", &Q_ORDER_NAME_HINT),
-    ("order_address", &Q_ORDER_ADDRESS_HINT),
-    ("order_contact", &Q_ORDER_CONTACT_HINT),
-];
 
 // --------------------------------------------------------------------------
-// Q_REASK_PREFIX
+// Public API
+// --------------------------------------------------------------------------
+
+/// Start (or restart) the form. Sets step = "order_items".
+pub fn start_form(app: &App, psid: &str) -> Reply {
+    if let Err(err) = app.db.set_form(psid, "order_items", &HashMap::new(), 0) {
+        error!(error = %err, "could not start order form");
+    }
+    question_for("order_items")
+}
+
+/// Re-ask the question for the stored step (used for stickers/images).
+pub fn current_question(row: &FormRow) -> Reply {
+    question_for(&row.step)
+}
+
+/// Advance the form with one input. Returns None when there is no active order form.
+pub async fn handle_input(app: &App, psid: &str, raw: &str) -> Option<Reply> {
+    let row = app.db.get_form(psid).ok().flatten()?;
+    if kind_of_step(&row.step) != Some(FormKind::Order) {
+        return None;
+    }
+
+    if is_cancel(raw) {
+        let _ = app.db.delete_form(psid);
+        return Some(Reply::text(Q_FORM_CANCELLED));
+    }
+
+    if row.step == "order_confirm" {
+        return Some(handle_confirm(app, psid, &row, raw));
+    }
+
+    let Some(value) = validate(&row.step, raw) else {
+        return Some(reask(app, psid, &row));
+    };
+
+    let key = row.step.strip_prefix("order_").unwrap_or(&row.step);
+    let mut data = row.data.clone();
+    data.insert(key.to_string(), value);
+
+    match row.step.as_str() {
+        "order_items" => Some(ask_confirm(app, psid, data).await),
+        "order_contact" => Some(finish(app, psid, &data).await),
+        step => {
+            let next = if step == "order_name" { "order_address" } else { "order_contact" };
+            if let Err(err) = app.db.set_form(psid, next, &data, 0) {
+                error!(error = %err, "could not save order form step");
+            }
+            Some(question_for(next))
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Internals
+// --------------------------------------------------------------------------
+
+fn validate(step: &str, raw: &str) -> Option<String> {
+    match step {
+        "order_items" => clean_len(raw, 2, 500),
+        "order_name" => clean_name(raw),
+        "order_address" => clean_len(raw, 5, 300),
+        "order_contact" => clean_ph_mobile(raw),
+        _ => None,
+    }
+}
+
+fn reask(app: &App, psid: &str, row: &FormRow) -> Reply {
+    let tries = row.tries + 1;
+    if tries >= MAX_TRIES {
+        let _ = app.db.delete_form(psid);
+        return Reply::text(Q_FORM_GAVE_UP);
+    }
+    if let Err(err) = app.db.set_form(psid, &row.step, &row.data, tries) {
+        error!(error = %err, "could not record failed attempt");
+    }
+    let hint = match row.step.as_str() {
+        "order_items" => Q_ORDER_ITEMS_HINT,
+        "order_confirm" => Q_ORDER_CONFIRM_HINT,
+        "order_name" => Q_ORDER_NAME_HINT,
+        "order_address" => Q_ORDER_ADDRESS_HINT,
+        _ => Q_ORDER_CONTACT_HINT,
+    };
+    let mut reply = Reply::text(format!("{Q_REASK_PREFIX}{hint}"));
+    if row.step == "order_confirm" {
+        reply.quick_replies = confirm_buttons();
+    }
+    reply
+}
+
+fn confirm_buttons() -> Vec<(String, String)> {
+    vec![qr("Tama po ✅", PAYLOAD_OK), qr("Papalitan ✏️", PAYLOAD_EDIT)]
+}
+
+/// Show the priced receipt and ask the customer to confirm it.
+async fn ask_confirm(app: &App, psid: &str, mut data: HashMap<String, String>) -> Reply {
+    let raw_items = data.get("items").cloned().unwrap_or_default();
+    let receipt = app.menu.build_receipt(&raw_items).await;
+
+    data.insert("menu_note".into(), receipt.lines.join("\n"));
+    if receipt.has_prices {
+        data.insert("total_estimate".into(), fmt_price(receipt.total));
+    } else {
+        data.remove("total_estimate");
+    }
+    if let Err(err) = app.db.set_form(psid, "order_confirm", &data, 0) {
+        error!(error = %err, "could not save order receipt");
+    }
+
+    let lines = receipt.lines.iter().map(|l| format!("• {l}")).collect::<Vec<_>>().join("\n");
+    let total = if receipt.has_prices {
+        fill(Q_TOTAL_ESTIMATE, &[("total", &fmt_price(receipt.total))])
+    } else {
+        Q_TOTAL_NO_PRICES.to_string()
+    };
+
+    let mut parts = vec!["Ito po ang order natin 🧾".to_string(), lines];
+    parts.extend(receipt.alternates);
+    parts.push(total);
+    parts.push("Tama po ba ito, o may papalit?".to_string());
+    Reply::new(parts.join("\n"), confirm_buttons())
+}
+
+/// Confirm step: accept / edit / neither.
+fn handle_confirm(app: &App, psid: &str, row: &FormRow, raw: &str) -> Reply {
+    match confirm_intent(raw) {
+        Confirm::Ok => {
+            // menu_note and total_estimate were stored by ask_confirm.
+            if let Err(err) = app.db.set_form(psid, "order_name", &row.data, 0) {
+                error!(error = %err, "could not advance order form");
+            }
+            question_for("order_name")
+        }
+        Confirm::Edit => {
+            let mut data = row.data.clone();
+            data.remove("menu_note");
+            data.remove("total_estimate");
+            if let Err(err) = app.db.set_form(psid, "order_items", &data, 0) {
+                error!(error = %err, "could not restart items step");
+            }
+            info!("order receipt: customer edits items");
+            question_for("order_items")
+        }
+        Confirm::Unknown => reask(app, psid, row),
+    }
+}
+
+/// Save the order, notify the team, clear the form.
+async fn finish(app: &App, psid: &str, data: &HashMap<String, String>) -> Reply {
+    let get = |k: &str| data.get(k).cloned().unwrap_or_default();
+    let (name, address, contact, estimate) = (get("name"), get("address"), get("contact"), get("total_estimate"));
+    let items = match get("menu_note") {
+        note if !note.is_empty() => note,
+        _ => get("items"),
+    };
+
+    let order_id = match app.db.add_order(psid, &items, &name, &address, &contact, &estimate) {
+        Ok(id) => id,
+        Err(err) => {
+            error!(error = %err, "could not save order");
+            0
+        }
+    };
+    let _ = app.db.delete_form(psid);
+
+    let notifier = app.notifier.clone();
+    let (p, i, e, n, a, c) = (psid.to_string(), items.clone(), estimate.clone(), name.clone(), address.clone(), contact.clone());
+    tokio::spawn(async move {
+        notifier.notify_order(&p, order_id, &i, &e, &n, &a, &c).await;
+    });
+
+    let total_line = if estimate.is_empty() {
+        String::new()
+    } else {
+        format!("• Estimated total: ₱{estimate}\n")
+    };
+    Reply::text(fill(
+        Q_FORM_DONE,
+        &[
+            ("name", &name),
+            ("oid", &order_id.to_string()),
+            ("items", &items),
+            ("total_line", &total_line),
+            ("address", &address),
+            ("contact", &contact),
+        ],
+    ))
+}
+
+fn question_for(step: &str) -> Reply {
+    match step {
+        "order_items" => Reply::text(Q_ORDER_ITEMS),
+        "order_name" => Reply::text(Q_ORDER_NAME),
+        "order_address" => Reply::text(Q_ORDER_ADDRESS),
+        "order_contact" => Reply::text(Q_ORDER_CONTACT),
+        "order_confirm" => Reply::new(
+            format!("{Q_ORDER_CONFIRM_HINT}"),
+            confirm_buttons(),
+        ),
+        _ => Reply::text(Q_FORM_CANCELLED),
+    }
+}
+
+// --------------------------------------------------------------------------
+// Texts (Taglish)
 // --------------------------------------------------------------------------
 
 const Q_REASK_PREFIX: &str = "Pasensya po — ";
 
-// --------------------------------------------------------------------------
-// DEBUG helper
-// --------------------------------------------------------------------------
+const Q_ORDER_ITEMS: &str = "Sige po! Order tayo 🛍️ Anong items po natin?\n\
+(e.g. 'iced white choco mocha + 2 cookies' — isulat na lang po ang buong order nyo.)\n\
+Paalala po: FREE po ang delivery sa Masaito at Lancaster residence; sa labas po natin isine-send via Lalamove. 😊";
+const Q_ORDER_ITEMS_HINT: &str = "isulat po ang buong order ninyo, e.g. '2 pcs Iced Latte + 1 Blueberry Cheesecake'. \
+('cancel' kung gusto nyo po tumigil)";
+const Q_ORDER_NAME: &str = "Anong pangalan po natin for the order?";
+const Q_ORDER_NAME_HINT: &str = "paki-type lang po ang pangalan (o pangalan ng nag-order), e.g. 'Maria Santos'. 😊";
+const Q_ORDER_ADDRESS: &str = "Anong full address po (house/unit + street + subdivision/barangay)?\n\
+🆓 FREE po natin: Masaito at Lancaster residence.";
+const Q_ORDER_ADDRESS_HINT: &str = "paki-type po ang buong delivery address, e.g. 'Blk 2 Lot 3, Masaito Residence, Kawit'. \
+('cancel' kung gusto nyo po tumigil)";
+const Q_ORDER_CONTACT: &str = "Anong mobile number po? (para po sa delivery updates, e.g. 0917-123-4567 o +639171234567)";
+const Q_ORDER_CONTACT_HINT: &str = "number po ba? Pakitype po ng PH mobile number, e.g. 09171234567. \
+('cancel' kung ayaw nyo na po)";
+const Q_ORDER_CONFIRM_HINT: &str = "Tama po ba ang order ninyo? Tap po ang button, o reply ng 'tama' \
+o 'palit' kung may papalitan. ('cancel' para tumigil)";
+const Q_TOTAL_ESTIMATE: &str = "Estimated total: ₱{total} (kakumpirmahin po ng team ang exact total)";
+const Q_TOTAL_NO_PRICES: &str = "(Presyo po — kakumpirmahin ng team ang exact total)";
+
+const Q_FORM_DONE: &str = "Salamat po, {name}! 🎉 Na-record na po ang order ninyo #{oid}:\n\
+• Items:\n{items}\n\
+{total_line}\
+• Address: {address}\n\
+• Mobile: {contact}\n\
+• Delivery: FREE po ito sa Masaito/Lancaster residence — sa labas po, Lalamove natin at sasabihin ng team ang exact fee. 😊\n\n\
+Ang aming team po ang magco-confirm DITO sa chat ng total, payment (cash/GCash) at delivery schedule. Sandali lang po sila. ☕";
+
+const Q_FORM_CANCELLED: &str = "Sige po — kinansel ko po muna ang order form 😊 \
+I-type lang po ang 'order' ulit kapag ready na kayo, o mag-message dito para makita ng team natin ang message nyo po.";
+const Q_FORM_GAVE_UP: &str = "Hindi ko na po maituloy ang order form, kinansel ko po muna ito 😅 \
+— i-type po ang 'order' ulit kahit kailan, o tap 'Order' button kapag ready.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Db;
-    use crate::menu::Menu;
-    use crate::config::Settings;
-    use std::collections::HashMap;
 
     #[test]
-    fn test_cancel_detection() {
-        assert!(is_cancel("cancel"));
-        assert!(is_cancel("Cancel po"));
-        assert!(is_cancel("wag na"));
-        assert!(!is_cancel("2 iced latte"));
+    fn confirm_words() {
+        assert_eq!(confirm_intent("tama po"), Confirm::Ok);
+        assert_eq!(confirm_intent("Tama po ✅"), Confirm::Ok);
+        assert_eq!(confirm_intent(PAYLOAD_OK), Confirm::Ok);
+        assert_eq!(confirm_intent("edit"), Confirm::Edit);
+        assert_eq!(confirm_intent("Mali!"), Confirm::Edit);
+        assert_eq!(confirm_intent(PAYLOAD_EDIT), Confirm::Edit);
+        assert_eq!(confirm_intent("random"), Confirm::Unknown);
     }
 
     #[test]
-    fn test_val_items() {
-        assert_eq!(_val_items("2 iced latte"), Some("2 iced latte".into()));
-        assert_eq!(_val_items("x"), None);
-    }
-
-    #[test]
-    fn test_confirm_map() {
-        assert_eq!(CONFIRM_MAP.lookup("tama po"), Some("ok"));
-        assert_eq!(CONFIRM_MAP.lookup("edit"), Some("edit"));
-        assert_eq!(CONFIRM_MAP.lookup("mali"), Some("edit"));
-        assert_eq!(CONFIRM_MAP.lookup("random"), None);
+    fn validators() {
+        assert_eq!(validate("order_items", "2 iced latte").as_deref(), Some("2 iced latte"));
+        assert_eq!(validate("order_items", "x"), None);
+        assert_eq!(validate("order_name", "Maria Santos").as_deref(), Some("Maria Santos"));
+        assert_eq!(validate("order_address", "abc"), None);
+        assert_eq!(validate("order_contact", "+63 917 123 4567").as_deref(), Some("09171234567"));
     }
 }
