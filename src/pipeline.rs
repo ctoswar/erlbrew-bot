@@ -24,6 +24,7 @@ use crate::forms::{self, FormKind, Reply};
 use crate::state::App;
 use crate::{events, orders};
 use anyhow::Result;
+use tracing::info;
 
 /// A normalised customer event (message, quick reply or postback).
 #[derive(Clone, Debug, Default)]
@@ -38,9 +39,19 @@ pub struct Incoming {
 pub async fn process(app: &App, inc: Incoming) -> Result<()> {
     let psid = inc.psid.as_str();
 
-    // 1) Echoes: our own messages are ignored; so are staff replies typed in the page inbox.
+    // 1) Page-side messages (echoes). Our own replies come back as echoes and are ignored;
+    //    any OTHER page-side message is a team member typing in the Page inbox — that is a
+    //    takeover, so the bot pauses the customer and drops any half-finished form.
     if inc.is_echo {
         app.db.upsert_user(psid)?;
+        if !app.db.is_bot_message(&inc.mid)? {
+            let already_paused = app.db.get_paused(psid)?;
+            app.db.set_paused(psid, true)?;
+            let _ = app.db.delete_form(psid);
+            if !already_paused {
+                info!(psid, "team replied; bot paused");
+            }
+        }
         return Ok(());
     }
 
@@ -394,6 +405,34 @@ mod tests {
         let app = App::for_test();
         process(&app, msg("t5", "p1", "nawala po yung points ko")).await.unwrap();
         assert!(app.db.get_paused("t5").unwrap());
+    }
+
+    #[tokio::test]
+    async fn human_takeover_pauses_the_bot_but_own_echoes_do_not() {
+        let app = App::for_test();
+        let u = "takeover";
+
+        // The bot's own echo (message id recorded when the bot sent it) is ignored.
+        app.db.mark_bot_message("mid.bot").unwrap();
+        process(
+            &app,
+            Incoming { psid: u.into(), mid: "mid.bot".into(), is_echo: true, ..Default::default() },
+        )
+        .await
+        .unwrap();
+        assert!(!app.db.get_paused(u).unwrap());
+
+        // A page-side message from a human pauses the customer and drops the form.
+        process(&app, msg(u, "m1", "order")).await.unwrap();
+        assert_eq!(step(&app, u).as_deref(), Some("order_items"));
+        process(
+            &app,
+            Incoming { psid: u.into(), mid: "mid.human".into(), is_echo: true, text: "hi".into(), ..Default::default() },
+        )
+        .await
+        .unwrap();
+        assert!(app.db.get_paused(u).unwrap(), "the bot must stop replying");
+        assert_eq!(step(&app, u), None, "the half-finished form must be dropped");
     }
 
     #[tokio::test]
